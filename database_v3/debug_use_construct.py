@@ -8,6 +8,7 @@ import traceback
 from pathlib import Path
 
 
+DEBUG_DATABASE_VERSION = "debug_database_v2_pod_eval_compatible"
 DEBUG_STREAM_SEED = 0xD06BEE29
 
 
@@ -20,6 +21,10 @@ BUG_KINDS = [
     "wrong_index",
     "wrong_modulo",
     "missing_edge_case",
+    "wrong_boolean_operator",
+    "integer_division",
+    "reverse_condition",
+    "wrong_accumulator_update",
 ]
 
 
@@ -57,13 +62,14 @@ def comment_tests(tests: list[str]) -> str:
 
 def normalize_single_line_completion(completion: str) -> str:
     """
-    Keep completion compatible with the existing pod_eval_vllm.py /
-    humaneval_sandbox checking path.
+    Keep completion compatible with pod_eval_vllm.py / humaneval_sandbox.
 
     Rules:
     - Completion is function body only.
     - Completion is exactly one physical non-empty line.
     - Completion is indented because the prompt already contains the function signature.
+    - No markdown fences.
+    - No full function definition.
     """
     completion = completion.replace("\r\n", "\n").replace("\r", "\n")
     lines = [line for line in completion.splitlines() if line.strip()]
@@ -78,6 +84,9 @@ def normalize_single_line_completion(completion: str) -> str:
 
     if line.startswith("def "):
         raise ValueError("Completion must be function body only, not a full def.")
+
+    if "```" in line:
+        raise ValueError("Completion must not contain markdown fences.")
 
     return "    " + line + "\n"
 
@@ -120,18 +129,31 @@ def make_record(
     test: str,
     buggy_code: str,
     seed: int,
+    metadata: dict | None = None,
 ) -> dict:
+    normalized_completion = normalize_single_line_completion(completion)
+
     return {
-        "src": f"procedural_debug/{kind}",
-        "kind": kind,
+        "database_version": DEBUG_DATABASE_VERSION,
+
+        # HumanEval / pod_eval_vllm core fields
         "task_id": f"debug/{kind}/{index:05d}",
         "prompt": prompt,
-        "completion": normalize_single_line_completion(completion),
+        "completion": normalized_completion,
         "test": test,
         "entry_point": entry_point,
-        "buggy_code": buggy_code,
+
+        # Compatibility aliases used by some evaluation/training paths
+        "canonical_solution": normalized_completion,
+        "gold": normalized_completion,
+
+        # Dataset bookkeeping
+        "src": f"procedural_debug/{kind}",
+        "kind": kind,
         "status": "gold_debug",
+        "buggy_code": buggy_code,
         "seed": seed,
+        "metadata": metadata or {},
     }
 
 
@@ -152,6 +174,7 @@ def rename_entry(
 
 def generate_item(kind: str, index: int, seed: int) -> dict:
     r = random.Random(seed)
+    metadata = {}
 
     if kind == "off_by_one_range":
         original_entry = "sum_to"
@@ -180,6 +203,7 @@ def generate_item(kind: str, index: int, seed: int) -> dict:
         ]
 
         completion = "return sum(range(1, n + 1))"
+        metadata = {"n_t": n_t}
 
     elif kind == "swap_subtract":
         original_entry = "first_minus_second"
@@ -225,6 +249,7 @@ def generate_item(kind: str, index: int, seed: int) -> dict:
         ]
 
         completion = "return sum(1 for x in arr if x >= threshold)"
+        metadata = {"threshold": threshold}
 
     elif kind == "wrong_init":
         original_entry = "product_of_list"
@@ -247,9 +272,11 @@ def generate_item(kind: str, index: int, seed: int) -> dict:
             "    assert candidate([5]) == 5",
             "    assert candidate([]) == 1",
             "    assert candidate([1, 2, 3, 4, 5]) == 120",
+            "    assert candidate([-2, 3]) == -6",
         ]
 
-        completion = "import math; return math.prod(arr)"
+        # Avoid import dependency inside the generated function body.
+        completion = "return 1 if not arr else __import__('functools').reduce(lambda a, b: a * b, arr, 1)"
 
     elif kind == "early_break":
         original_entry = "find_largest"
@@ -274,6 +301,7 @@ def generate_item(kind: str, index: int, seed: int) -> dict:
             "    assert candidate([1, 2, 3, 4, 5, 6]) == 6",
             "    assert candidate([5, 4, 3, 2, 1]) == 5",
             "    assert candidate([42]) == 42",
+            "    assert candidate([-10, -2, -30]) == -2",
         ]
 
         completion = "return max(arr)"
@@ -300,6 +328,7 @@ def generate_item(kind: str, index: int, seed: int) -> dict:
         ]
 
         completion = "return arr[-2]"
+        metadata = {"sample_arr": sample_arr}
 
     elif kind == "wrong_modulo":
         original_entry = "mod_then_double"
@@ -321,9 +350,11 @@ def generate_item(kind: str, index: int, seed: int) -> dict:
             f"    assert candidate({mod * 2 + 3}, modulus={mod}) == {2 * ((mod * 2 + 3) % mod)}",
             f"    assert candidate(0, modulus={mod}) == 0",
             f"    assert candidate({mod - 1}, modulus={mod}) == {2 * (mod - 1)}",
+            "    assert candidate(100, modulus=9) == 2 * (100 % 9)",
         ]
 
         completion = "return 2 * (n % modulus)"
+        metadata = {"mod": mod, "wrong_mod": wrong_mod}
 
     elif kind == "missing_edge_case":
         original_entry = "first_or_default"
@@ -343,9 +374,109 @@ def generate_item(kind: str, index: int, seed: int) -> dict:
             "    assert candidate([]) is None",
             "    assert candidate([], default=-1) == -1",
             "    assert candidate(['a']) == 'a'",
+            "    assert candidate([], default='empty') == 'empty'",
         ]
 
         completion = "return arr[0] if arr else default"
+
+    elif kind == "wrong_boolean_operator":
+        original_entry = "in_closed_interval"
+        low = r.randint(1, 10)
+        high = low + r.randint(5, 15)
+
+        buggy = (
+            f"def in_closed_interval(x, low={low}, high={high}):\n"
+            "    return x >= low or x <= high\n"
+        )
+
+        sig = (
+            f"def in_closed_interval(x: int, low: int = {low}, high: int = {high}) -> bool:\n"
+            '    """Return True if x is between low and high inclusive."""\n'
+        )
+
+        tests = [
+            f"    assert candidate({low}, low={low}, high={high}) is True",
+            f"    assert candidate({high}, low={low}, high={high}) is True",
+            f"    assert candidate({low - 1}, low={low}, high={high}) is False",
+            f"    assert candidate({high + 1}, low={low}, high={high}) is False",
+            f"    assert candidate({(low + high) // 2}, low={low}, high={high}) is True",
+        ]
+
+        completion = "return low <= x <= high"
+        metadata = {"low": low, "high": high}
+
+    elif kind == "integer_division":
+        original_entry = "average_pair"
+
+        buggy = (
+            "def average_pair(a, b):\n"
+            "    return (a + b) // 2\n"
+        )
+
+        sig = (
+            "def average_pair(a: float, b: float) -> float:\n"
+            '    """Return the arithmetic mean of a and b as a float."""\n'
+        )
+
+        tests = [
+            "    assert candidate(1, 2) == 1.5",
+            "    assert candidate(10, 20) == 15.0",
+            "    assert candidate(-1, 1) == 0.0",
+            "    assert candidate(2.5, 3.5) == 3.0",
+        ]
+
+        completion = "return (a + b) / 2"
+
+    elif kind == "reverse_condition":
+        original_entry = "clip_nonnegative"
+
+        buggy = (
+            "def clip_nonnegative(x):\n"
+            "    if x >= 0:\n"
+            "        return 0\n"
+            "    return x\n"
+        )
+
+        sig = (
+            "def clip_nonnegative(x: int) -> int:\n"
+            '    """Return x if x is nonnegative, otherwise return 0."""\n'
+        )
+
+        tests = [
+            "    assert candidate(5) == 5",
+            "    assert candidate(0) == 0",
+            "    assert candidate(-3) == 0",
+            "    assert candidate(100) == 100",
+        ]
+
+        completion = "return x if x >= 0 else 0"
+
+    elif kind == "wrong_accumulator_update":
+        original_entry = "count_even"
+
+        buggy = (
+            "def count_even(arr):\n"
+            "    count = 0\n"
+            "    for x in arr:\n"
+            "        if x % 2 == 0:\n"
+            "            count += x\n"
+            "    return count\n"
+        )
+
+        sig = (
+            "def count_even(arr: list[int]) -> int:\n"
+            '    """Return the number of even integers in arr."""\n'
+        )
+
+        tests = [
+            "    assert candidate([1, 2, 3, 4]) == 2",
+            "    assert candidate([2, 4, 6]) == 3",
+            "    assert candidate([1, 3, 5]) == 0",
+            "    assert candidate([]) == 0",
+            "    assert candidate([0, -2, -3]) == 2",
+        ]
+
+        completion = "return sum(1 for x in arr if x % 2 == 0)"
 
     else:
         raise ValueError(f"Unknown debug kind: {kind}")
@@ -365,6 +496,14 @@ def generate_item(kind: str, index: int, seed: int) -> dict:
 
     test_block = make_test_block(tests)
 
+    metadata.update(
+        {
+            "original_entry": original_entry,
+            "renamed_entry": entry_point,
+            "num_tests": len(tests),
+        }
+    )
+
     return make_record(
         kind=kind,
         index=index,
@@ -374,6 +513,7 @@ def generate_item(kind: str, index: int, seed: int) -> dict:
         test=test_block,
         buggy_code=buggy,
         seed=seed,
+        metadata=metadata,
     )
 
 
@@ -386,7 +526,13 @@ def build_records(seed: int, n_per_kind: int, shuffle: bool = True) -> list[dict
     for kind in BUG_KINDS:
         for _ in range(n_per_kind):
             item_seed = main_rng.randint(0, 2**31 - 1)
-            record = generate_item(kind, index=index, seed=item_seed)
+
+            record = generate_item(
+                kind=kind,
+                index=index,
+                seed=item_seed,
+            )
+
             records.append(record)
             index += 1
 
@@ -417,7 +563,15 @@ def verify_record(record: dict) -> tuple[bool, str]:
         exec(test_code, namespace)
 
         entry_point = record["entry_point"]
+
+        if entry_point not in namespace:
+            return False, f"entry_point {entry_point!r} not defined after exec."
+
         candidate = namespace[entry_point]
+
+        if "check" not in namespace:
+            return False, "check(candidate) was not defined by test code."
+
         namespace["check"](candidate)
 
         return True, ""
@@ -432,7 +586,10 @@ def verify_records(records: list[dict], max_failures: int = 10) -> bool:
     for record in records:
         ok, err = verify_record(record)
 
+        record["verified"] = bool(ok)
+
         if not ok:
+            record["verify_error"] = err
             failures.append((record["task_id"], record["kind"], err))
 
             if len(failures) >= max_failures:
@@ -484,6 +641,36 @@ def assert_all_completions_one_line(records: list[dict]) -> None:
         raise SystemExit(1)
 
 
+def assert_required_fields(records: list[dict]) -> None:
+    required = [
+        "task_id",
+        "prompt",
+        "completion",
+        "test",
+        "entry_point",
+        "canonical_solution",
+        "src",
+        "kind",
+        "status",
+        "seed",
+    ]
+
+    bad = []
+
+    for record in records:
+        for field in required:
+            if field not in record:
+                bad.append((record.get("task_id"), field))
+
+    if bad:
+        print("Found records with missing required fields:", file=sys.stderr)
+
+        for task_id, field in bad[:20]:
+            print(f"Task: {task_id}, missing: {field}", file=sys.stderr)
+
+        raise SystemExit(1)
+
+
 def print_counts(records: list[dict]) -> None:
     counts = {}
 
@@ -500,8 +687,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Build a deterministic debug JSONL database with one-line "
-            "gold fixed function bodies compatible with pod_eval_vllm.py / "
-            "humaneval_sandbox checking."
+            "gold fixed function bodies compatible with updated pod_eval_vllm.py / "
+            "HumanEval-style checking."
         )
     )
 
@@ -552,6 +739,7 @@ def main() -> None:
         shuffle=not args.no_shuffle,
     )
 
+    assert_required_fields(records)
     assert_all_completions_one_line(records)
 
     if args.verify:
@@ -568,12 +756,15 @@ def main() -> None:
     print("DONE")
     print("=" * 80)
     print(f"Output: {output_path}")
+    print(f"Database version: {DEBUG_DATABASE_VERSION}")
     print(f"Total records: {len(records)}")
     print(f"Bug kinds: {len(BUG_KINDS)}")
     print(f"Records per kind: {args.n_per_kind}")
     print(f"Append mode: {args.append}")
     print(f"Local verified: {args.verify}")
-    print("Completion format: one-line function body only")
+    print("Completion format: one-line indented function body only")
+    print("Core fields: prompt, completion, test, entry_point")
+    print("Compatibility fields: canonical_solution, gold, metadata")
 
     print_counts(records)
 

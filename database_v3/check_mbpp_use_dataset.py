@@ -44,6 +44,17 @@ def extract_def_names(code: str) -> list[str]:
 
 
 def check_completion_format(completion: str) -> list[str]:
+    """
+    MBPP-style completions may be multi-line, but they must be function body only.
+
+    Required:
+    - completion is a string
+    - completion is non-empty
+    - completion ends with newline
+    - no markdown fences
+    - no full def
+    - every non-empty line starts with 4 spaces
+    """
     problems = []
 
     if not isinstance(completion, str):
@@ -54,23 +65,56 @@ def check_completion_format(completion: str) -> list[str]:
         problems.append("completion is empty")
         return problems
 
-    nonempty_lines = [line for line in completion.splitlines() if line.strip()]
-
-    if len(nonempty_lines) != 1:
-        problems.append(
-            f"completion must have exactly one non-empty line, got {len(nonempty_lines)}"
-        )
-
-    first_line = nonempty_lines[0] if nonempty_lines else ""
-
-    if not first_line.startswith("    "):
-        problems.append("completion line is not indented with 4 spaces")
-
-    if first_line.strip().startswith("def "):
-        problems.append("completion contains full function definition; expected body only")
+    if not completion.endswith("\n"):
+        problems.append("completion does not end with newline")
 
     if "```" in completion:
         problems.append("completion contains markdown fence")
+
+    nonempty_lines = [line for line in completion.splitlines() if line.strip()]
+
+    for i, line in enumerate(nonempty_lines, start=1):
+        stripped = line.strip()
+
+        if stripped.startswith("def "):
+            problems.append(
+                f"completion line {i} contains full function definition; expected body only"
+            )
+
+        if not line.startswith("    "):
+            problems.append(
+                f"completion line {i} is not indented with 4 spaces: {line!r}"
+            )
+
+    return problems
+
+
+def check_test_list(record: dict) -> list[str]:
+    problems = []
+
+    test = record.get("test")
+    test_list = record.get("test_list")
+
+    if "test_list" not in record:
+        return problems
+
+    if not isinstance(test_list, list):
+        problems.append("test_list exists but is not a list")
+        return problems
+
+    for i, item in enumerate(test_list):
+        if not isinstance(item, str):
+            problems.append(f"test_list[{i}] is not a string")
+
+    if isinstance(test, str):
+        extracted = [
+            line.strip()
+            for line in test.splitlines()
+            if line.strip().startswith("assert ")
+        ]
+
+        if test_list != extracted:
+            problems.append("test_list does not match assert lines extracted from test")
 
     return problems
 
@@ -83,15 +127,22 @@ def check_schema(record: dict) -> list[str]:
         return problems
 
     required_fields = [
+        "database_version",
         "task_id",
         "prompt",
         "completion",
         "test",
         "entry_point",
+        "canonical_solution",
+        "gold",
+        "text",
+        "code",
+        "test_list",
         "src",
         "kind",
         "status",
         "seed",
+        "metadata",
     ]
 
     for field in required_fields:
@@ -99,11 +150,16 @@ def check_schema(record: dict) -> list[str]:
             problems.append(f"missing field: {field}")
 
     string_fields = [
+        "database_version",
         "task_id",
         "prompt",
         "completion",
         "test",
         "entry_point",
+        "canonical_solution",
+        "gold",
+        "text",
+        "code",
         "src",
         "kind",
         "status",
@@ -119,23 +175,32 @@ def check_schema(record: dict) -> list[str]:
     if "metadata" in record and not isinstance(record.get("metadata"), dict):
         problems.append("metadata exists but is not a dict")
 
-    if "prompt" in record and isinstance(record.get("prompt"), str):
-        prompt = record["prompt"]
+    prompt = record.get("prompt", "")
+    test = record.get("test", "")
+    completion = record.get("completion", "")
 
+    if isinstance(prompt, str):
         if "def " not in prompt:
             problems.append("prompt does not appear to contain a function signature")
 
-        if "Output only the corrected function body" not in prompt:
+        if "Output only the function body" not in prompt:
             problems.append("prompt missing expected body-only instruction")
 
-    if "test" in record and isinstance(record.get("test"), str):
-        test = record["test"]
+        if "Problem:" not in prompt:
+            problems.append("prompt missing Problem section")
 
+        if "Complete the function below" not in prompt:
+            problems.append("prompt missing completion section")
+
+    if isinstance(test, str):
         if "def check(candidate):" not in test:
             problems.append("test does not define check(candidate)")
 
+        if "assert " not in test:
+            problems.append("test does not contain any assert statements")
+
     if "completion" in record:
-        problems.extend(check_completion_format(record.get("completion")))
+        problems.extend(check_completion_format(completion))
 
     if "canonical_solution" in record:
         canonical_solution = record.get("canonical_solution")
@@ -153,6 +218,16 @@ def check_schema(record: dict) -> list[str]:
         elif gold != record.get("completion"):
             problems.append("gold does not match completion")
 
+    if "code" in record:
+        code = record.get("code")
+
+        if not isinstance(code, str):
+            problems.append("code exists but is not a string")
+        elif code != record.get("completion"):
+            problems.append("code does not match completion")
+
+    problems.extend(check_test_list(record))
+
     return problems
 
 
@@ -169,6 +244,8 @@ def verify_record_execution(record: dict) -> tuple[bool, str, dict]:
     test_code = test
 
     verification["entry_point"] = entry_point
+    verification["prompt_nonempty_lines"] = count_nonempty_lines(prompt)
+    verification["completion_nonempty_lines"] = count_nonempty_lines(completion)
     verification["solution_nonempty_lines"] = count_nonempty_lines(solution_code)
     verification["test_nonempty_lines"] = count_nonempty_lines(test_code)
     verification["defined_functions_before_exec"] = extract_def_names(solution_code)
@@ -177,7 +254,8 @@ def verify_record_execution(record: dict) -> tuple[bool, str, dict]:
         exec(solution_code, namespace)
 
         defined_after_solution = [
-            name for name, value in namespace.items()
+            name
+            for name, value in namespace.items()
             if callable(value) and not name.startswith("__")
         ]
 
@@ -218,15 +296,11 @@ def check_record(line_no: int, record: dict) -> tuple[list[str], dict]:
     if "_json_error" in record:
         return problems, verification
 
-    if schema_problems:
-        # Still attempt execution only if the core executable fields exist and are strings.
-        core_ok = all(
-            isinstance(record.get(field), str)
-            for field in ["prompt", "completion", "test", "entry_point"]
-        )
+    core_fields = ["prompt", "completion", "test", "entry_point"]
+    core_ok = all(isinstance(record.get(field), str) for field in core_fields)
 
-        if not core_ok:
-            return problems, verification
+    if not core_ok:
+        return problems, verification
 
     ok, err, verification = verify_record_execution(record)
 
@@ -237,7 +311,7 @@ def check_record(line_no: int, record: dict) -> tuple[list[str], dict]:
     return problems, verification
 
 
-def short_json(obj, max_chars: int = 2500) -> str:
+def short_json(obj, max_chars: int = 3000) -> str:
     try:
         text = json.dumps(obj, ensure_ascii=False, indent=2)
     except Exception:
@@ -258,7 +332,6 @@ def format_record_for_log(
     prompt = record.get("prompt", "")
     completion = record.get("completion", "")
     test = record.get("test", "")
-    buggy_code = record.get("buggy_code", "")
 
     lines = []
 
@@ -273,25 +346,26 @@ def format_record_for_log(
     lines.append(f"SEED: {record.get('seed', 'unknown')}")
     lines.append("")
 
-    lines.append("[BUGGY CODE]")
-    if buggy_code:
-        lines.append(str(buggy_code).strip())
-    else:
-        lines.append("None")
+    lines.append("[TEXT / PROBLEM]")
+    lines.append(str(record.get("text", "")).strip())
     lines.append("")
 
     lines.append("[PROMPT]")
     lines.append(str(prompt).strip() if prompt else "None")
     lines.append("")
 
-    lines.append("[COMPLETION]")
+    lines.append("[COMPLETION REPR]")
     lines.append(repr(completion))
+    lines.append("")
+
+    lines.append("[COMPLETION TEXT]")
+    lines.append(str(completion).rstrip() if completion else "None")
     lines.append("")
 
     lines.append("[PROMPT + COMPLETION TAIL]")
     if prompt or completion:
         combined = str(prompt) + str(completion)
-        lines.append(combined[-1500:].rstrip())
+        lines.append(combined[-2000:].rstrip())
     else:
         lines.append("None")
     lines.append("")
@@ -300,14 +374,24 @@ def format_record_for_log(
     lines.append(str(test).strip() if test else "None")
     lines.append("")
 
+    if "test_list" in record:
+        lines.append("[TEST LIST]")
+        lines.append(short_json(record.get("test_list")))
+        lines.append("")
+
     if "canonical_solution" in record:
-        lines.append("[CANONICAL SOLUTION]")
+        lines.append("[CANONICAL SOLUTION REPR]")
         lines.append(repr(record.get("canonical_solution")))
         lines.append("")
 
     if "gold" in record:
-        lines.append("[GOLD]")
+        lines.append("[GOLD REPR]")
         lines.append(repr(record.get("gold")))
+        lines.append("")
+
+    if "code" in record:
+        lines.append("[CODE REPR]")
+        lines.append(repr(record.get("code")))
         lines.append("")
 
     if "metadata" in record:
@@ -339,6 +423,7 @@ def print_terminal_record(
     show_completion: bool = False,
     show_test: bool = False,
     show_error: bool = False,
+    show_text: bool = False,
 ) -> None:
     print("=" * 80)
     print(f"Line: {line_no}")
@@ -346,7 +431,8 @@ def print_terminal_record(
     print(f"Kind: {record.get('kind', 'unknown')}")
     print(f"Status: {record.get('status', 'unknown')}")
     print(f"Entry point: {record.get('entry_point', 'unknown')}")
-    print(f"Completion lines: {count_nonempty_lines(record.get('completion', ''))}")
+    print(f"Completion non-empty lines: {count_nonempty_lines(record.get('completion', ''))}")
+    print(f"Passed tests: {verification.get('passed_tests')}")
 
     if problems:
         print("Problems:")
@@ -354,6 +440,13 @@ def print_terminal_record(
             print(f"  - {p}")
     else:
         print("Problems: none")
+
+    if show_text:
+        print("")
+        print("[TEXT / PROBLEM]")
+        print("-" * 40)
+        print(str(record.get("text", "")).rstrip())
+        print("-" * 40)
 
     if show_prompt:
         print("")
@@ -388,8 +481,8 @@ def print_terminal_record(
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            "Check debug database JSONL records and verify that prompt + completion "
-            "passes the HumanEval-style test block."
+            "Check synthetic MBPP-style JSONL records and verify that "
+            "prompt + completion passes the HumanEval-style test block."
         )
     )
 
@@ -397,15 +490,21 @@ def main():
         "path",
         nargs="?",
         type=str,
-        default="dataset/debug_database_all_cases.jsonl",
-        help="Path to debug database JSONL.",
+        default="dataset/mbpp_database_all_cases.jsonl",
+        help="Path to MBPP database JSONL.",
     )
 
     parser.add_argument(
         "--log",
         type=str,
-        default="database_v3/debug_dataset_check.log",
+        default="database_v3/mbpp_dataset_check.log",
         help="Path to output readable log file.",
+    )
+
+    parser.add_argument(
+        "--show-text",
+        action="store_true",
+        help="Print problem text to terminal.",
     )
 
     parser.add_argument(
@@ -534,6 +633,7 @@ def main():
                 record=record,
                 problems=problems,
                 verification=verification,
+                show_text=args.show_text,
                 show_prompt=args.show_prompt,
                 show_completion=args.show_completion,
                 show_test=args.show_test,

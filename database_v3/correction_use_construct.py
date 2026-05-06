@@ -8,6 +8,7 @@ import traceback
 from pathlib import Path
 
 
+CORRECTION_DATABASE_VERSION = "correction_database_v2_pod_eval_compatible"
 CORRECTION_STREAM_SEED = 0xC0FFEE29
 
 
@@ -55,6 +56,44 @@ def comment_tests(tests: list[str]) -> str:
     )
 
 
+def normalize_body_completion(completion: str) -> str:
+    """
+    Normalize a corrected function body for pod_eval_vllm.py / HumanEval-style checking.
+
+    Rules:
+    - Completion is function body only.
+    - Multi-line body is allowed.
+    - Completion must not include a full def.
+    - Completion must not include markdown fences.
+    - Non-empty lines must be indented because prompt already contains the function signature.
+    """
+    completion = completion.replace("\r\n", "\n").replace("\r", "\n")
+    completion = completion.rstrip() + "\n"
+
+    lines = completion.splitlines()
+    nonempty_lines = [line for line in lines if line.strip()]
+
+    if not nonempty_lines:
+        raise ValueError("Completion must not be empty.")
+
+    for line in nonempty_lines:
+        stripped = line.strip()
+
+        if stripped.startswith("def "):
+            raise ValueError("Completion must be function body only, not a full def.")
+
+        if "```" in line:
+            raise ValueError("Completion must not contain markdown fences.")
+
+        if not line.startswith("    "):
+            raise ValueError(
+                "Every non-empty completion line must be indented with at least 4 spaces. "
+                f"Bad line: {line!r}"
+            )
+
+    return completion
+
+
 def make_prompt(
     buggy_code: str,
     error_trace: str,
@@ -68,10 +107,10 @@ def make_prompt(
     return (
         "# The following Python function fails its tests with the\n"
         "# error trace shown below. The intended behaviour is in the\n"
-        "# corrected docstring. Read the trace, identify the line\n"
-        "# that produces the wrong value, and write the CORRECTED\n"
-        "# implementation. Output only the function body, no extra\n"
-        "# explanation, no markdown fences.\n"
+        "# corrected docstring. Read the trace, identify the bug,\n"
+        "# and write the CORRECTED implementation.\n"
+        "# Output only the corrected function body.\n"
+        "# Do not include extra explanation or markdown fences.\n"
         "#\n"
         "# Buggy version, DO NOT include in your output:\n"
         f"{buggy_commented}\n"
@@ -101,19 +140,32 @@ def make_record(
     buggy_code: str,
     error_trace: str,
     seed: int,
+    metadata: dict | None = None,
 ) -> dict:
+    normalized_completion = normalize_body_completion(completion)
+
     return {
-        "src": f"procedural_correction/{kind}",
-        "kind": kind,
+        "database_version": CORRECTION_DATABASE_VERSION,
+
+        # Core HumanEval / pod_eval_vllm.py fields
         "task_id": f"correction/{kind}/{index:05d}",
         "prompt": prompt,
-        "completion": completion.rstrip() + "\n",
+        "completion": normalized_completion,
         "test": test,
         "entry_point": entry_point,
+
+        # Compatibility aliases
+        "canonical_solution": normalized_completion,
+        "gold": normalized_completion,
+
+        # Dataset bookkeeping
+        "src": f"procedural_correction/{kind}",
+        "kind": kind,
+        "status": "gold_correction",
         "buggy_code": buggy_code,
         "error_trace": error_trace,
-        "status": "gold_correction",
         "seed": seed,
+        "metadata": metadata or {},
     }
 
 
@@ -130,15 +182,15 @@ def rename_entry(
     buggy = buggy.replace(f"def {original_entry}(", f"def {entry}(")
     sig = sig.replace(f"def {original_entry}(", f"def {entry}(")
 
-    # Rename function references inside traces such as:
-    #   in first_or_default
     error_trace = error_trace.replace(f"in {original_entry}\n", f"in {entry}\n")
+    error_trace = error_trace.replace(f"in {original_entry}\r\n", f"in {entry}\n")
 
     return entry, buggy, sig, error_trace
 
 
 def generate_item(kind: str, index: int, seed: int) -> dict:
     r = random.Random(seed)
+    metadata = {}
 
     if kind == "off_by_one_range":
         original_entry = "sum_to"
@@ -173,8 +225,8 @@ def generate_item(kind: str, index: int, seed: int) -> dict:
         error_trace = (
             '  File "test_sum_to.py", line 3, in test_sum_to\n'
             f"    assert candidate({n_t}) == {expected}\n"
-            f"AssertionError: expected {expected}, "
-            f"got {actual_buggy} (off by {expected - actual_buggy})"
+            f"AssertionError: expected {expected}, got {actual_buggy} "
+            f"(off by {expected - actual_buggy})"
         )
 
         completion = (
@@ -183,6 +235,12 @@ def generate_item(kind: str, index: int, seed: int) -> dict:
             "        total += i\n"
             "    return total\n"
         )
+
+        metadata = {
+            "n_t": n_t,
+            "expected": expected,
+            "actual_buggy": actual_buggy,
+        }
 
     elif kind == "swap_subtract":
         original_entry = "first_minus_second"
@@ -210,9 +268,7 @@ def generate_item(kind: str, index: int, seed: int) -> dict:
             "AssertionError: expected 7, got -7 (sign reversed)"
         )
 
-        completion = (
-            "    return a - b\n"
-        )
+        completion = "    return a - b\n"
 
     elif kind == "wrong_comparator":
         original_entry = "at_least"
@@ -241,9 +297,9 @@ def generate_item(kind: str, index: int, seed: int) -> dict:
             "AssertionError: expected 3, got 1 (only counted strictly-greater values)"
         )
 
-        completion = (
-            "    return sum(1 for x in arr if x >= threshold)\n"
-        )
+        completion = "    return sum(1 for x in arr if x >= threshold)\n"
+
+        metadata = {"threshold": threshold}
 
     elif kind == "wrong_init":
         original_entry = "product_of_list"
@@ -266,6 +322,7 @@ def generate_item(kind: str, index: int, seed: int) -> dict:
             "    assert candidate([5]) == 5",
             "    assert candidate([]) == 1",
             "    assert candidate([1, 2, 3, 4, 5]) == 120",
+            "    assert candidate([-2, 3]) == -6",
         ]
 
         error_trace = (
@@ -304,6 +361,7 @@ def generate_item(kind: str, index: int, seed: int) -> dict:
             "    assert candidate([1, 2, 3, 4, 5, 6]) == 6",
             "    assert candidate([5, 4, 3, 2, 1]) == 5",
             "    assert candidate([42]) == 42",
+            "    assert candidate([-10, -2, -30]) == -2",
         ]
 
         error_trace = (
@@ -344,12 +402,13 @@ def generate_item(kind: str, index: int, seed: int) -> dict:
         error_trace = (
             '  File "test_second_last.py", line 1, in test_second_last\n'
             f"    assert candidate({sample_arr!r}) == {sample_arr[-2]}\n"
-            f"AssertionError: expected {sample_arr[-2]}, got {sample_arr[-1]} (off-by-one index)"
+            f"AssertionError: expected {sample_arr[-2]}, got {sample_arr[-1]} "
+            "(off-by-one index)"
         )
 
-        completion = (
-            "    return arr[-2]\n"
-        )
+        completion = "    return arr[-2]\n"
+
+        metadata = {"sample_arr": sample_arr}
 
     elif kind == "wrong_modulo":
         original_entry = "mod_then_double"
@@ -371,6 +430,7 @@ def generate_item(kind: str, index: int, seed: int) -> dict:
             f"    assert candidate({mod * 2 + 3}, modulus={mod}) == {2 * ((mod * 2 + 3) % mod)}",
             f"    assert candidate(0, modulus={mod}) == 0",
             f"    assert candidate({mod - 1}, modulus={mod}) == {2 * (mod - 1)}",
+            "    assert candidate(100, modulus=9) == 2 * (100 % 9)",
         ]
 
         error_trace = (
@@ -380,9 +440,9 @@ def generate_item(kind: str, index: int, seed: int) -> dict:
             f"(used wrong divisor: {wrong_mod} instead of {mod})"
         )
 
-        completion = (
-            "    return 2 * (n % modulus)\n"
-        )
+        completion = "    return 2 * (n % modulus)\n"
+
+        metadata = {"mod": mod, "wrong_mod": wrong_mod}
 
     elif kind == "missing_edge_case":
         original_entry = "first_or_default"
@@ -402,6 +462,7 @@ def generate_item(kind: str, index: int, seed: int) -> dict:
             "    assert candidate([]) is None",
             "    assert candidate([], default=-1) == -1",
             "    assert candidate(['a']) == 'a'",
+            "    assert candidate([], default='empty') == 'empty'",
         ]
 
         error_trace = (
@@ -438,6 +499,15 @@ def generate_item(kind: str, index: int, seed: int) -> dict:
 
     test_block = make_test_block(tests)
 
+    metadata.update(
+        {
+            "original_entry": original_entry,
+            "renamed_entry": entry_point,
+            "num_tests": len(tests),
+            "completion_lines": len([line for line in completion.splitlines() if line.strip()]),
+        }
+    )
+
     return make_record(
         kind=kind,
         index=index,
@@ -448,6 +518,7 @@ def generate_item(kind: str, index: int, seed: int) -> dict:
         buggy_code=buggy,
         error_trace=error_trace,
         seed=seed,
+        metadata=metadata,
     )
 
 
@@ -460,7 +531,13 @@ def build_records(seed: int, n_per_kind: int, shuffle: bool = True) -> list[dict
     for kind in BUG_KINDS:
         for _ in range(n_per_kind):
             item_seed = main_rng.randint(0, 2**31 - 1)
-            record = generate_item(kind, index=index, seed=item_seed)
+
+            record = generate_item(
+                kind=kind,
+                index=index,
+                seed=item_seed,
+            )
+
             records.append(record)
             index += 1
 
@@ -491,7 +568,15 @@ def verify_record(record: dict) -> tuple[bool, str]:
         exec(test_code, namespace)
 
         entry_point = record["entry_point"]
+
+        if entry_point not in namespace:
+            return False, f"entry_point {entry_point!r} not defined after exec."
+
         candidate = namespace[entry_point]
+
+        if "check" not in namespace:
+            return False, "check(candidate) was not defined by test code."
+
         namespace["check"](candidate)
 
         return True, ""
@@ -506,17 +591,20 @@ def verify_records(records: list[dict], max_failures: int = 10) -> bool:
     for record in records:
         ok, err = verify_record(record)
 
+        record["verified"] = bool(ok)
+
         if not ok:
+            record["verify_error"] = err
             failures.append((record["task_id"], record["kind"], err))
 
             if len(failures) >= max_failures:
                 break
 
     if not failures:
-        print("Verification: all generated corrections passed tests.")
+        print("Local verification: all generated corrections passed tests.")
         return True
 
-    print("Verification failed.")
+    print("Local verification failed.")
     print(f"Failures shown: {len(failures)}")
 
     for task_id, kind, err in failures:
@@ -526,6 +614,103 @@ def verify_records(records: list[dict], max_failures: int = 10) -> bool:
         print(err)
 
     return False
+
+
+def assert_required_fields(records: list[dict]) -> None:
+    required = [
+        "database_version",
+        "task_id",
+        "prompt",
+        "completion",
+        "test",
+        "entry_point",
+        "canonical_solution",
+        "gold",
+        "src",
+        "kind",
+        "status",
+        "buggy_code",
+        "error_trace",
+        "seed",
+        "metadata",
+    ]
+
+    bad = []
+
+    for record in records:
+        for field in required:
+            if field not in record:
+                bad.append((record.get("task_id"), field))
+
+    if bad:
+        print("Found records with missing required fields:", file=sys.stderr)
+
+        for task_id, field in bad[:20]:
+            print(f"Task: {task_id}, missing: {field}", file=sys.stderr)
+
+        raise SystemExit(1)
+
+
+def assert_completion_format(records: list[dict]) -> None:
+    bad = []
+
+    for record in records:
+        completion = record.get("completion", "")
+
+        try:
+            normalized = normalize_body_completion(completion)
+        except Exception as e:
+            bad.append(
+                (
+                    record.get("task_id"),
+                    record.get("kind"),
+                    str(e),
+                    completion,
+                )
+            )
+            continue
+
+        if normalized != completion:
+            bad.append(
+                (
+                    record.get("task_id"),
+                    record.get("kind"),
+                    "completion is not normalized",
+                    completion,
+                )
+            )
+
+        if record.get("canonical_solution") != completion:
+            bad.append(
+                (
+                    record.get("task_id"),
+                    record.get("kind"),
+                    "canonical_solution does not match completion",
+                    completion,
+                )
+            )
+
+        if record.get("gold") != completion:
+            bad.append(
+                (
+                    record.get("task_id"),
+                    record.get("kind"),
+                    "gold does not match completion",
+                    completion,
+                )
+            )
+
+    if bad:
+        print("Found bad completion formatting:", file=sys.stderr)
+
+        for task_id, kind, reason, completion in bad[:10]:
+            print("=" * 80, file=sys.stderr)
+            print(f"Task: {task_id}", file=sys.stderr)
+            print(f"Kind: {kind}", file=sys.stderr)
+            print(f"Reason: {reason}", file=sys.stderr)
+            print(repr(completion), file=sys.stderr)
+
+        raise SystemExit(1)
 
 
 def print_counts(records: list[dict]) -> None:
@@ -542,7 +727,11 @@ def print_counts(records: list[dict]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Build a deterministic correction JSONL database with gold fixed function bodies."
+        description=(
+            "Build a deterministic correction JSONL database with multi-line "
+            "gold fixed function bodies compatible with updated pod_eval_vllm.py / "
+            "HumanEval-style checking."
+        )
     )
 
     parser.add_argument(
@@ -592,11 +781,14 @@ def main() -> None:
         shuffle=not args.no_shuffle,
     )
 
+    assert_required_fields(records)
+    assert_completion_format(records)
+
     if args.verify:
         ok = verify_records(records)
 
         if not ok:
-            print("Not writing JSONL because verification failed.", file=sys.stderr)
+            print("Not writing JSONL because local verification failed.", file=sys.stderr)
             raise SystemExit(1)
 
     output_path = Path(args.output)
@@ -606,11 +798,15 @@ def main() -> None:
     print("DONE")
     print("=" * 80)
     print(f"Output: {output_path}")
+    print(f"Database version: {CORRECTION_DATABASE_VERSION}")
     print(f"Total records: {len(records)}")
     print(f"Bug kinds: {len(BUG_KINDS)}")
     print(f"Records per kind: {args.n_per_kind}")
     print(f"Append mode: {args.append}")
-    print(f"Verified: {args.verify}")
+    print(f"Local verified: {args.verify}")
+    print("Completion format: multi-line indented function body only")
+    print("Core fields: prompt, completion, test, entry_point")
+    print("Compatibility fields: canonical_solution, gold, metadata")
 
     print_counts(records)
 
