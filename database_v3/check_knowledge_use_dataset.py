@@ -7,7 +7,7 @@ import traceback
 from pathlib import Path
 
 
-DEF_RE = re.compile(r"^\s*def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+FINAL_RE = re.compile(r"Final answer:\s*(.+?)\s*$", re.IGNORECASE | re.DOTALL)
 
 
 def load_jsonl(path: Path):
@@ -27,55 +27,33 @@ def load_jsonl(path: Path):
                 }
 
 
-def count_nonempty_lines(text: str) -> int:
-    return len([line for line in str(text).splitlines() if line.strip()])
+def normalize_text(text: str) -> str:
+    text = str(text).strip()
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"\s+", " ", text)
+    return text
 
 
-def extract_def_names(code: str) -> list[str]:
-    names = []
-
-    for line in str(code).splitlines():
-        match = DEF_RE.match(line)
-
-        if match:
-            names.append(match.group(1))
-
-    return names
+def normalize_answer(text: str) -> str:
+    text = normalize_text(text)
+    text = text.lower()
+    text = text.strip(" .")
+    return text
 
 
-def check_completion_format(completion: str) -> list[str]:
-    problems = []
-
+def extract_final_answer(completion: str):
     if not isinstance(completion, str):
-        problems.append("completion is not a string")
-        return problems
+        return None
 
-    if not completion.strip():
-        problems.append("completion is empty")
-        return problems
+    match = FINAL_RE.search(completion.strip())
 
-    nonempty_lines = [line for line in completion.splitlines() if line.strip()]
+    if not match:
+        return None
 
-    if len(nonempty_lines) != 1:
-        problems.append(
-            f"completion must have exactly one non-empty line, got {len(nonempty_lines)}"
-        )
-
-    first_line = nonempty_lines[0] if nonempty_lines else ""
-
-    if not first_line.startswith("    "):
-        problems.append("completion line is not indented with 4 spaces")
-
-    if first_line.strip().startswith("def "):
-        problems.append("completion contains full function definition; expected body only")
-
-    if "```" in completion:
-        problems.append("completion contains markdown fence")
-
-    return problems
+    return match.group(1).strip()
 
 
-def check_schema(record: dict) -> list[str]:
+def check_schema(record: dict, answer_only: bool = False) -> list[str]:
     problems = []
 
     if "_json_error" in record:
@@ -83,15 +61,19 @@ def check_schema(record: dict) -> list[str]:
         return problems
 
     required_fields = [
+        "database_version",
         "task_id",
-        "prompt",
-        "completion",
-        "test",
-        "entry_point",
         "src",
         "kind",
+        "question",
+        "prompt",
+        "completion",
+        "answer",
+        "gold",
+        "answer_type",
         "status",
         "seed",
+        "metadata",
     ]
 
     for field in required_fields:
@@ -99,13 +81,16 @@ def check_schema(record: dict) -> list[str]:
             problems.append(f"missing field: {field}")
 
     string_fields = [
+        "database_version",
         "task_id",
-        "prompt",
-        "completion",
-        "test",
-        "entry_point",
         "src",
         "kind",
+        "question",
+        "prompt",
+        "completion",
+        "answer",
+        "gold",
+        "answer_type",
         "status",
     ]
 
@@ -119,125 +104,126 @@ def check_schema(record: dict) -> list[str]:
     if "metadata" in record and not isinstance(record.get("metadata"), dict):
         problems.append("metadata exists but is not a dict")
 
-    if "prompt" in record and isinstance(record.get("prompt"), str):
-        prompt = record["prompt"]
+    prompt = record.get("prompt", "")
+    completion = record.get("completion", "")
 
-        if "def " not in prompt:
-            problems.append("prompt does not appear to contain a function signature")
+    if isinstance(prompt, str):
+        if "Question:" not in prompt:
+            problems.append("prompt missing Question section")
 
-        if "Output only the corrected function body" not in prompt:
-            problems.append("prompt missing expected body-only instruction")
+        if "Answer:" not in prompt:
+            problems.append("prompt missing Answer section")
 
-    if "test" in record and isinstance(record.get("test"), str):
-        test = record["test"]
+        if answer_only:
+            if "Output only the answer" not in prompt:
+                problems.append("answer-only prompt missing output-only instruction")
+        else:
+            if "Final answer:" not in prompt:
+                problems.append("prompt missing Final answer instruction")
 
-        if "def check(candidate):" not in test:
-            problems.append("test does not define check(candidate)")
+    if isinstance(completion, str):
+        if not completion.strip():
+            problems.append("completion is empty")
 
-    if "completion" in record:
-        problems.extend(check_completion_format(record.get("completion")))
+        if not completion.endswith("\n"):
+            problems.append("completion does not end with newline")
 
-    if "canonical_solution" in record:
-        canonical_solution = record.get("canonical_solution")
+        if "```" in completion:
+            problems.append("completion contains markdown fence")
 
-        if not isinstance(canonical_solution, str):
-            problems.append("canonical_solution exists but is not a string")
-        elif canonical_solution != record.get("completion"):
-            problems.append("canonical_solution does not match completion")
+        if not answer_only and "Final answer:" not in completion:
+            problems.append("completion missing Final answer line")
 
-    if "gold" in record:
+    if "answer" in record and "gold" in record:
+        answer = record.get("answer")
         gold = record.get("gold")
 
-        if not isinstance(gold, str):
-            problems.append("gold exists but is not a string")
-        elif gold != record.get("completion"):
-            problems.append("gold does not match completion")
+        if isinstance(answer, str) and isinstance(gold, str):
+            if normalize_answer(answer) != normalize_answer(gold):
+                problems.append("answer does not match gold after normalization")
 
     return problems
 
 
-def verify_record_execution(record: dict) -> tuple[bool, str, dict]:
-    namespace = {}
+def verify_answer(record: dict, answer_only: bool = False) -> tuple[bool, str, dict]:
     verification = {}
 
-    prompt = record.get("prompt", "")
-    completion = record.get("completion", "")
-    test = record.get("test", "")
-    entry_point = record.get("entry_point", "")
-
-    solution_code = prompt + completion
-    test_code = test
-
-    verification["entry_point"] = entry_point
-    verification["solution_nonempty_lines"] = count_nonempty_lines(solution_code)
-    verification["test_nonempty_lines"] = count_nonempty_lines(test_code)
-    verification["defined_functions_before_exec"] = extract_def_names(solution_code)
-
     try:
-        exec(solution_code, namespace)
+        completion = record.get("completion", "")
+        gold = record.get("gold", "")
 
-        defined_after_solution = [
-            name for name, value in namespace.items()
-            if callable(value) and not name.startswith("__")
-        ]
+        if answer_only:
+            predicted = completion.strip()
+            has_final_answer_line = extract_final_answer(completion) is not None
+        else:
+            predicted = extract_final_answer(completion)
+            has_final_answer_line = predicted is not None
 
-        verification["defined_callables_after_solution"] = sorted(defined_after_solution)
+            if predicted is None:
+                verification["predicted"] = None
+                verification["gold"] = gold
+                verification["has_final_answer_line"] = False
+                return False, "No 'Final answer:' line found.", verification
 
-        if entry_point not in namespace:
+        normalized_predicted = normalize_answer(predicted)
+        normalized_gold = normalize_answer(gold)
+
+        verification["answer_only"] = answer_only
+        verification["has_final_answer_line"] = has_final_answer_line
+        verification["predicted"] = predicted
+        verification["gold"] = gold
+        verification["normalized_predicted"] = normalized_predicted
+        verification["normalized_gold"] = normalized_gold
+        verification["matched"] = normalized_predicted == normalized_gold
+
+        if normalized_predicted != normalized_gold:
             return (
                 False,
-                f"entry_point {entry_point!r} not defined after executing prompt + completion",
+                f"Answer mismatch: predicted={predicted!r}, gold={gold!r}",
                 verification,
             )
-
-        candidate = namespace[entry_point]
-
-        exec(test_code, namespace)
-
-        if "check" not in namespace:
-            return False, "test code did not define check(candidate)", verification
-
-        namespace["check"](candidate)
-
-        verification["passed_tests"] = True
 
         return True, "", verification
 
     except Exception:
-        verification["passed_tests"] = False
+        verification["exception"] = traceback.format_exc()
         return False, traceback.format_exc(), verification
 
 
-def check_record(line_no: int, record: dict) -> tuple[list[str], dict]:
+def check_record(
+    line_no: int,
+    record: dict,
+    answer_only: bool = False,
+) -> tuple[list[str], dict]:
     problems = []
     verification = {}
 
-    schema_problems = check_schema(record)
+    schema_problems = check_schema(record, answer_only=answer_only)
     problems.extend(schema_problems)
 
     if "_json_error" in record:
         return problems, verification
 
-    if schema_problems:
-        # Still attempt execution only if the core executable fields exist and are strings.
-        core_ok = all(
-            isinstance(record.get(field), str)
-            for field in ["prompt", "completion", "test", "entry_point"]
-        )
+    core_ok = all(
+        isinstance(record.get(field), str)
+        for field in ["completion", "gold"]
+    )
 
-        if not core_ok:
-            return problems, verification
+    if not core_ok:
+        return problems, verification
 
-    ok, err, verification = verify_record_execution(record)
+    ok, err, verification = verify_answer(
+        record=record,
+        answer_only=answer_only,
+    )
 
     if not ok:
-        problems.append("local execution verification failed")
-        verification["execution_error"] = err
+        problems.append(err)
 
     return problems, verification
 
 
-def short_json(obj, max_chars: int = 2500) -> str:
+def short_json(obj, max_chars: int = 3000) -> str:
     try:
         text = json.dumps(obj, ensure_ascii=False, indent=2)
     except Exception:
@@ -257,8 +243,6 @@ def format_record_for_log(
 ) -> str:
     prompt = record.get("prompt", "")
     completion = record.get("completion", "")
-    test = record.get("test", "")
-    buggy_code = record.get("buggy_code", "")
 
     lines = []
 
@@ -269,46 +253,38 @@ def format_record_for_log(
     lines.append(f"SRC: {record.get('src', 'unknown')}")
     lines.append(f"KIND: {record.get('kind', 'unknown')}")
     lines.append(f"STATUS: {record.get('status', 'unknown')}")
-    lines.append(f"ENTRY POINT: {record.get('entry_point', 'unknown')}")
+    lines.append(f"ANSWER TYPE: {record.get('answer_type', 'unknown')}")
     lines.append(f"SEED: {record.get('seed', 'unknown')}")
     lines.append("")
 
-    lines.append("[BUGGY CODE]")
-    if buggy_code:
-        lines.append(str(buggy_code).strip())
-    else:
-        lines.append("None")
+    lines.append("[QUESTION]")
+    lines.append(str(record.get("question", "")).strip())
     lines.append("")
 
     lines.append("[PROMPT]")
     lines.append(str(prompt).strip() if prompt else "None")
     lines.append("")
 
-    lines.append("[COMPLETION]")
+    lines.append("[COMPLETION REPR]")
     lines.append(repr(completion))
     lines.append("")
 
-    lines.append("[PROMPT + COMPLETION TAIL]")
-    if prompt or completion:
-        combined = str(prompt) + str(completion)
-        lines.append(combined[-1500:].rstrip())
-    else:
-        lines.append("None")
+    lines.append("[COMPLETION TEXT]")
+    lines.append(str(completion).rstrip() if completion else "None")
     lines.append("")
 
-    lines.append("[TEST]")
-    lines.append(str(test).strip() if test else "None")
+    lines.append("[ANSWER]")
+    lines.append(str(record.get("answer", "")).strip())
     lines.append("")
 
-    if "canonical_solution" in record:
-        lines.append("[CANONICAL SOLUTION]")
-        lines.append(repr(record.get("canonical_solution")))
-        lines.append("")
+    lines.append("[GOLD]")
+    lines.append(str(record.get("gold", "")).strip())
+    lines.append("")
 
-    if "gold" in record:
-        lines.append("[GOLD]")
-        lines.append(repr(record.get("gold")))
-        lines.append("")
+    lines.append("[EXTRACTED FINAL ANSWER]")
+    extracted = extract_final_answer(completion)
+    lines.append(str(extracted) if extracted is not None else "None")
+    lines.append("")
 
     if "metadata" in record:
         lines.append("[METADATA]")
@@ -337,16 +313,17 @@ def print_terminal_record(
     verification: dict,
     show_prompt: bool = False,
     show_completion: bool = False,
-    show_test: bool = False,
-    show_error: bool = False,
+    show_metadata: bool = False,
 ) -> None:
     print("=" * 80)
     print(f"Line: {line_no}")
     print(f"Task ID: {record.get('task_id', 'unknown')}")
     print(f"Kind: {record.get('kind', 'unknown')}")
     print(f"Status: {record.get('status', 'unknown')}")
-    print(f"Entry point: {record.get('entry_point', 'unknown')}")
-    print(f"Completion lines: {count_nonempty_lines(record.get('completion', ''))}")
+    print(f"Question: {str(record.get('question', ''))[:220]}")
+    print(f"Gold: {record.get('gold')}")
+    print(f"Predicted: {verification.get('predicted')}")
+    print(f"Matched: {verification.get('matched')}")
 
     if problems:
         print("Problems:")
@@ -370,26 +347,19 @@ def print_terminal_record(
         print(str(record.get("completion", "")).rstrip())
         print("-" * 40)
 
-    if show_test:
+    if show_metadata:
         print("")
-        print("[TEST]")
+        print("[METADATA]")
         print("-" * 40)
-        print(str(record.get("test", "")).rstrip())
-        print("-" * 40)
-
-    if show_error and verification.get("execution_error"):
-        print("")
-        print("[EXECUTION ERROR]")
-        print("-" * 40)
-        print(verification["execution_error"])
+        print(short_json(record.get("metadata"), max_chars=1200))
         print("-" * 40)
 
 
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            "Check debug database JSONL records and verify that prompt + completion "
-            "passes the HumanEval-style test block."
+            "Check synthetic knowledge JSONL records and verify that "
+            "completion answers match gold answers."
         )
     )
 
@@ -397,15 +367,21 @@ def main():
         "path",
         nargs="?",
         type=str,
-        default="dataset/debug_database_all_cases.jsonl",
-        help="Path to debug database JSONL.",
+        default="dataset/knowledge_database_all_cases.jsonl",
+        help="Path to knowledge database JSONL.",
     )
 
     parser.add_argument(
         "--log",
         type=str,
-        default="database_v3/debug_dataset_check.log",
+        default="database_v3/knowledge_dataset_check.log",
         help="Path to output readable log file.",
+    )
+
+    parser.add_argument(
+        "--answer-only",
+        action="store_true",
+        help="Check completions as direct answer-only outputs.",
     )
 
     parser.add_argument(
@@ -421,15 +397,9 @@ def main():
     )
 
     parser.add_argument(
-        "--show-test",
+        "--show-metadata",
         action="store_true",
-        help="Print test block to terminal.",
-    )
-
-    parser.add_argument(
-        "--show-error",
-        action="store_true",
-        help="Print execution traceback to terminal for failing records.",
+        help="Print metadata to terminal.",
     )
 
     parser.add_argument(
@@ -478,6 +448,7 @@ def main():
     status_counts = {}
     kind_counts = {}
     version_counts = {}
+    answer_type_counts = {}
 
     with log_path.open("w", encoding="utf-8") as log_f:
         for line_no, record in load_jsonl(path):
@@ -498,14 +469,17 @@ def main():
             status = record.get("status", "unknown")
             kind = record.get("kind", "unknown")
             version = record.get("database_version", "unknown")
+            answer_type = record.get("answer_type", "unknown")
 
             status_counts[status] = status_counts.get(status, 0) + 1
             kind_counts[kind] = kind_counts.get(kind, 0) + 1
             version_counts[version] = version_counts.get(version, 0) + 1
+            answer_type_counts[answer_type] = answer_type_counts.get(answer_type, 0) + 1
 
             problems, verification = check_record(
                 line_no=line_no,
                 record=record,
+                answer_only=args.answer_only,
             )
 
             if problems:
@@ -536,8 +510,7 @@ def main():
                 verification=verification,
                 show_prompt=args.show_prompt,
                 show_completion=args.show_completion,
-                show_test=args.show_test,
-                show_error=args.show_error,
+                show_metadata=args.show_metadata,
             )
 
         summary_lines = []
@@ -546,6 +519,7 @@ def main():
         summary_lines.append("=" * 100)
         summary_lines.append(f"Input file: {path}")
         summary_lines.append(f"Log file: {log_path}")
+        summary_lines.append(f"Answer-only mode: {args.answer_only}")
         summary_lines.append(f"Total JSONL records seen: {total_seen}")
         summary_lines.append(f"Records checked after filters: {total_checked}")
         summary_lines.append(f"Records written to log: {logged_count}")
@@ -561,6 +535,11 @@ def main():
         summary_lines.append("Status counts:")
         for status, count in sorted(status_counts.items()):
             summary_lines.append(f"  {status}: {count}")
+
+        summary_lines.append("")
+        summary_lines.append("Answer type counts:")
+        for answer_type, count in sorted(answer_type_counts.items()):
+            summary_lines.append(f"  {answer_type}: {count}")
 
         summary_lines.append("")
         summary_lines.append("Kind counts:")

@@ -149,7 +149,7 @@ def main():
         "path",
         nargs="?",
         type=str,
-        default="dataset/tool_use_database_all_cases.jsonl",
+        default="dataset/cleaned_tool_use_database_all_cases.jsonl",
         help="Path to tool_use_dataset.jsonl",
     )
 
