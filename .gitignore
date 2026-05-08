@@ -19,6 +19,7 @@ models/
 wandb/
 sft_lora_qwen3/
 local_dataset/
+my_train/
 
 # Secrets
 .env
