@@ -18,6 +18,7 @@ MULTI_DOC_KINDS = [
     "latest_doc_resolution",
     "count_across_docs",
     "compare_across_docs",
+    "multi_doc_synthesis",
 ]
 
 
@@ -82,6 +83,39 @@ DOC_TOPICS = [
 ]
 
 
+ORG_PREFIXES = [
+    "Azure", "Bronze", "Cedar", "Dawn", "Ember", "Frost", "Golden",
+    "Harbor", "Ivory", "Juniper", "Keystone", "Lantern", "Meadow",
+    "North", "Orchid", "Pioneer", "Quartz", "River", "Silver", "Thorn",
+    "Violet", "Willow", "Amber", "Copper", "Echo", "Marble", "Opal",
+    "Sable", "Timber", "Verdant",
+]
+
+ORG_NOUNS = [
+    "Archive", "Circle", "Collective", "Guild", "Institute", "League",
+    "Museum", "Observatory", "Registry", "Society", "Trust", "Workshop",
+    "Foundation", "Council", "Library", "Bureau", "Network", "Consortium",
+]
+
+ORG_SUFFIXES = [
+    "of Cartographers",
+    "of Field Notes",
+    "of Quiet Records",
+    "of Seasonal Studies",
+    "of Coastal Surveys",
+    "of Public Works",
+    "of Lantern Keepers",
+    "of Meadow Science",
+    "of Archive Stewards",
+    "of River Histories",
+    "of Northern Maps",
+    "of Civic Gardens",
+    "of Weather Logs",
+    "of Harbor Studies",
+    "of Stone Markers",
+]
+
+
 FINAL_RE = re.compile(r"Final answer:\s*(.+?)\s*$", re.IGNORECASE | re.DOTALL)
 
 
@@ -127,6 +161,10 @@ def synthetic_sentence(r: random.Random, min_words: int = 8, max_words: int = 16
     words = [synthetic_word(r) for _ in range(r.randint(min_words, max_words))]
     words[0] = words[0].capitalize()
     return " ".join(words) + "."
+
+
+def synthetic_org_topic(r: random.Random) -> str:
+    return f"{r.choice(ORG_PREFIXES)} {r.choice(ORG_NOUNS)} {r.choice(ORG_SUFFIXES)}"
 
 
 def filler_text(r: random.Random, sentences: int = 3) -> str:
@@ -248,6 +286,13 @@ def generate_single_doc_lookup(
     filler_sentences: int,
 ):
     docs = []
+
+    if num_docs > len(NAMES):
+        raise ValueError(
+            f"single_doc_lookup requires num_docs <= {len(NAMES)} "
+            "to keep staff names unique."
+        )
+
     selected_names = r.sample(NAMES, k=max(8, num_docs))
 
     target_record = None
@@ -570,8 +615,10 @@ def generate_compare_across_docs(
 
     docs = []
 
+    used_budget_units = r.sample(range(50, 901), k=len(selected_projects))
+
     for i, project in enumerate(selected_projects):
-        budget = r.randint(50, 900) * 1000
+        budget = used_budget_units[i] * 1000
         owner = r.choice(NAMES)
         city = r.choice(CITIES)
 
@@ -652,6 +699,260 @@ def generate_compare_across_docs(
     return docs, question, answer, evidence, metadata
 
 
+def generate_multi_doc_synthesis(
+    r: random.Random,
+    num_docs: int,
+    filler_sentences: int,
+):
+    """
+    Procedural multi-document synthesis items.
+
+    Adapted from the original multi_doc_synthesis_bench function.
+
+    Creates several short organization fact cards. Each card has one
+    numeric attribute. The question requires retrieving and combining
+    values from two or three cards.
+
+    Supported synthesis kinds:
+      - sum
+      - difference
+      - compare
+      - ratio
+      - sum_three
+      - difference_three
+    """
+
+    qkinds = [
+        "sum",
+        "difference",
+        "compare",
+        "ratio",
+        "sum_three",
+        "difference_three",
+    ]
+
+    # Original updated version defaults to at least 7 cards.
+    n_cards = max(7, num_docs, 3)
+
+    topics: list[str] = []
+    seen_topics: set[str] = set()
+    synth_attempts = 0
+
+    while len(topics) < n_cards and synth_attempts < n_cards * 16:
+        synth_attempts += 1
+        topic = synthetic_org_topic(r)
+
+        if topic in seen_topics:
+            continue
+
+        seen_topics.add(topic)
+        topics.append(topic)
+
+    if len(topics) < 3:
+        raise ValueError("Could not synthesize enough distinct organization topics.")
+
+    values: list[int] = []
+    used: set[int] = set()
+
+    for c in range(n_cards):
+        lo = 100 * (2 * c + 1)
+        hi = lo + 80
+        value = r.randint(lo, hi)
+
+        while value in used:
+            value += 7
+
+        used.add(value)
+        values.append(value)
+
+    attribute_templates = [
+        "Founded a long time ago, {topic} reports a current membership of {n}.",
+        "{topic} catalogs {n} unique entries in its public archive.",
+        "An annual yield of {n} units is recorded by {topic} each season.",
+        "The roster of {topic} stands at {n} active members this year.",
+        "Records from {topic} list {n} distinct artefacts on display.",
+    ]
+
+    docs: list[dict] = []
+
+    for c, (topic, value) in enumerate(zip(topics, values)):
+        template = attribute_templates[c % len(attribute_templates)]
+
+        text = (
+            template.format(topic=topic, n=value)
+            + " Visitors describe its hall as quiet and orderly. "
+            + "Its committee meets quarterly to review activities. "
+            + filler_text(r, sentences=filler_sentences)
+        )
+
+        docs.append(
+            make_doc(
+                doc_id=f"DOC-{c + 1:03d}",
+                title=f"Fact Card for {topic}",
+                text=text,
+            )
+        )
+
+    a_idx, b_idx = r.sample(range(n_cards), 2)
+
+    a_topic = topics[a_idx]
+    b_topic = topics[b_idx]
+
+    a_val = values[a_idx]
+    b_val = values[b_idx]
+
+    synthesis_kind = r.choice(qkinds)
+
+    c_idx = None
+    c_topic = None
+    c_val = None
+
+    if synthesis_kind == "sum":
+        answer = str(a_val + b_val)
+        question = (
+            f"Considering only {a_topic} and {b_topic}, what is the "
+            f"combined total of the numeric attribute reported in each "
+            f"of their documents?"
+        )
+        evidence = (
+            f"{a_topic} has value {a_val}; {b_topic} has value {b_val}; "
+            f"their combined total is {answer}."
+        )
+
+    elif synthesis_kind == "difference":
+        larger, smaller = (a_val, b_val) if a_val > b_val else (b_val, a_val)
+        larger_topic, smaller_topic = (
+            (a_topic, b_topic) if a_val > b_val else (b_topic, a_topic)
+        )
+
+        answer = str(larger - smaller)
+        question = (
+            f"How many more does {larger_topic} have than {smaller_topic} "
+            f"on the numeric attribute reported in their documents?"
+        )
+        evidence = (
+            f"{larger_topic} has value {larger}; {smaller_topic} has value "
+            f"{smaller}; the difference is {answer}."
+        )
+
+    elif synthesis_kind == "compare":
+        larger_topic = a_topic if a_val > b_val else b_topic
+        larger_value = a_val if a_val > b_val else b_val
+        smaller_topic = b_topic if a_val > b_val else a_topic
+        smaller_value = b_val if a_val > b_val else a_val
+
+        answer = larger_topic
+        question = (
+            f"Comparing the numeric attribute reported by {a_topic} and "
+            f"{b_topic}, which one has the larger value?"
+        )
+        evidence = (
+            f"{larger_topic} has value {larger_value}, while "
+            f"{smaller_topic} has value {smaller_value}; therefore "
+            f"{larger_topic} is larger."
+        )
+
+    elif synthesis_kind == "ratio":
+        larger, smaller = (a_val, b_val) if a_val >= b_val else (b_val, a_val)
+        larger_topic, smaller_topic = (
+            (a_topic, b_topic) if a_val >= b_val else (b_topic, a_topic)
+        )
+
+        answer = str(larger // smaller)
+        question = (
+            f"How many times larger, rounded down to an integer, is the "
+            f"larger numeric attribute between {a_topic} and {b_topic}?"
+        )
+        evidence = (
+            f"{larger_topic} has value {larger}; {smaller_topic} has value "
+            f"{smaller}; rounded-down ratio is {answer}."
+        )
+
+    elif synthesis_kind == "sum_three":
+        third_pool = [idx for idx in range(n_cards) if idx not in (a_idx, b_idx)]
+        c_idx = r.choice(third_pool)
+
+        c_topic = topics[c_idx]
+        c_val = values[c_idx]
+
+        answer = str(a_val + b_val + c_val)
+        question = (
+            f"Considering only {a_topic}, {b_topic}, and {c_topic}, what "
+            f"is the combined total of the numeric attribute reported in "
+            f"their three documents?"
+        )
+        evidence = (
+            f"{a_topic} has value {a_val}; {b_topic} has value {b_val}; "
+            f"{c_topic} has value {c_val}; their combined total is {answer}."
+        )
+
+    else:
+        third_pool = [idx for idx in range(n_cards) if idx not in (a_idx, b_idx)]
+        c_idx = r.choice(third_pool)
+
+        c_topic = topics[c_idx]
+        c_val = values[c_idx]
+
+        three = sorted(
+            [
+                (a_val, a_topic),
+                (b_val, b_topic),
+                (c_val, c_topic),
+            ],
+            reverse=True,
+        )
+
+        answer = str(three[0][0] - three[1][0] - three[2][0])
+        question = (
+            f"Considering only {a_topic}, {b_topic}, and {c_topic}: take "
+            f"the largest of the three numeric attributes, subtract the "
+            f"middle one, then subtract the smallest. What is the result?"
+        )
+        evidence = (
+            f"The three values are {three[0][0]}, {three[1][0]}, and "
+            f"{three[2][0]}; {three[0][0]} - {three[1][0]} - "
+            f"{three[2][0]} = {answer}."
+        )
+
+    if synthesis_kind in ("sum_three", "difference_three"):
+        involved_indices = {a_idx, b_idx, c_idx}
+        involved_topics = [a_topic, b_topic, c_topic]
+    else:
+        involved_indices = {a_idx, b_idx}
+        involved_topics = [a_topic, b_topic]
+
+    if synthesis_kind == "compare":
+        loser_topic = b_topic if a_val > b_val else a_topic
+
+        confuser_answers = [
+            topic
+            for idx, topic in enumerate(topics)
+            if idx not in (a_idx, b_idx)
+        ]
+        confuser_answers.append(loser_topic)
+
+    else:
+        confuser_answers = [
+            str(values[idx])
+            for idx in range(n_cards)
+            if idx not in involved_indices
+        ]
+
+    metadata = {
+        "synthesis_kind": synthesis_kind,
+        "topics": topics,
+        "values": values,
+        "involved_indices": sorted(involved_indices),
+        "involved_topics": involved_topics,
+        "confuser_answers": confuser_answers,
+        "requires_docs": len(involved_indices),
+        "requires_hops": len(involved_indices),
+        "operation": "multi_doc_synthesis",
+    }
+
+    return docs, question, answer, evidence, metadata
+
+
 def generate_item(
     kind: str,
     index: int,
@@ -692,6 +993,13 @@ def generate_item(
 
     elif kind == "compare_across_docs":
         docs, question, answer, evidence, metadata = generate_compare_across_docs(
+            r=r,
+            num_docs=num_docs,
+            filler_sentences=filler_sentences,
+        )
+
+    elif kind == "multi_doc_synthesis":
+        docs, question, answer, evidence, metadata = generate_multi_doc_synthesis(
             r=r,
             num_docs=num_docs,
             filler_sentences=filler_sentences,
@@ -1021,6 +1329,27 @@ def print_doc_stats(records: list[dict]) -> None:
     print(f"  Avg docs_text chars: {sum(char_counts) // len(char_counts)}")
 
 
+def validate_args(args) -> None:
+    if args.num_docs < 2:
+        print("--num-docs must be at least 2 for multi-doc tasks.", file=sys.stderr)
+        raise SystemExit(1)
+
+    if args.num_docs > len(NAMES):
+        print(
+            f"--num-docs must be <= {len(NAMES)} because single_doc_lookup "
+            "uses unique staff names.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+    if args.num_docs > 12:
+        print(
+            "Warning: --num-docs > 12 may create synthetic ticket dates with "
+            "month values above 12 in latest_doc_resolution.",
+            file=sys.stderr,
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
@@ -1054,7 +1383,10 @@ def main() -> None:
         "--num-docs",
         type=int,
         default=6,
-        help="Number of documents per record.",
+        help=(
+            "Requested number of documents per record. "
+            "multi_doc_synthesis uses at least 7 documents."
+        ),
     )
 
     parser.add_argument(
@@ -1090,9 +1422,7 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    if args.num_docs < 2:
-        print("--num-docs must be at least 2 for multi-doc tasks.", file=sys.stderr)
-        raise SystemExit(1)
+    validate_args(args)
 
     answer_style = "answer_only" if args.answer_only else "short"
 
@@ -1126,7 +1456,7 @@ def main() -> None:
     print(f"Total records: {len(records)}")
     print(f"Multi-doc kinds: {len(MULTI_DOC_KINDS)}")
     print(f"Records per kind: {args.n_per_kind}")
-    print(f"Documents per record: {args.num_docs}")
+    print(f"Requested documents per record: {args.num_docs}")
     print(f"Filler sentences per document: {args.filler_sentences}")
     print(f"Append mode: {args.append}")
     print(f"Answer style: {answer_style}")

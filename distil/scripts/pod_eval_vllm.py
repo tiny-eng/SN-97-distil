@@ -49,6 +49,7 @@ File layout (single-file — uploaded to remote GPU pod via SCP):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 import argparse
+import contextlib
 import gc
 import glob
 import hashlib
@@ -67,6 +68,145 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
+
+try:
+    from scripts.eval_benchmarks import (
+        NOISE_PERTURBATION_TEMPLATES,
+        _noise_safe_letter_swap,
+        _noise_case_jitter,
+        _noise_extra_whitespace,
+        _noise_common_misspellings,
+        _noise_drop_sentence_periods,
+    )
+except Exception:
+    from eval_benchmarks import (
+        NOISE_PERTURBATION_TEMPLATES,
+        _noise_safe_letter_swap,
+        _noise_case_jitter,
+        _noise_extra_whitespace,
+        _noise_common_misspellings,
+        _noise_drop_sentence_periods,
+    )
+try:
+    from scripts.eval_items import _rot_text
+except Exception:
+    from eval_items import _rot_text
+try:
+    from scripts.eval_prompt_accounting import validate_teacher_logprob_coverage
+except Exception:
+    try:
+        from eval_prompt_accounting import validate_teacher_logprob_coverage
+    except Exception:
+        def validate_teacher_logprob_coverage(total_prompts, usable_prompts):
+            total = max(0, int(total_prompts or 0))
+            usable = max(0, int(usable_prompts or 0))
+            coverage = (usable / total) if total > 0 else 0.0
+            try:
+                min_coverage = float(os.environ.get("DISTIL_MIN_TEACHER_LOGPROB_COVERAGE", "0.5"))
+            except (TypeError, ValueError):
+                min_coverage = 0.5
+            try:
+                min_prompts = int(os.environ.get("DISTIL_MIN_EFFECTIVE_TEACHER_PROMPTS", "30"))
+            except (TypeError, ValueError):
+                min_prompts = 30
+            min_coverage = min(1.0, max(0.0, min_coverage))
+            min_prompts = max(1, min_prompts)
+            stats = {
+                "n_teacher_prompts_total": total,
+                "n_teacher_prompts_with_logprobs": usable,
+                "n_teacher_prompts_dropped_missing_logprobs": max(0, total - usable),
+                "teacher_logprob_coverage": round(coverage, 6),
+            }
+            if usable < min_prompts or coverage < min_coverage:
+                raise RuntimeError(
+                    "API teacher logprob coverage below quality floor: "
+                    f"{usable}/{total} usable ({coverage:.1%}); require at least "
+                    f"{min_prompts} prompts and {min_coverage:.0%} coverage"
+                )
+            return stats
+try:
+    from scripts.eval_progress_io import (
+        DebouncedProgressWriter,
+        atomic_json_write as _shared_atomic_json_write,
+    )
+except Exception:
+    try:
+        from eval_progress_io import (  # type: ignore
+            DebouncedProgressWriter,
+            atomic_json_write as _shared_atomic_json_write,
+        )
+    except Exception:
+        def _shared_atomic_json_write(path, data):
+            tmp = f"{path}.tmp.{os.getpid()}"
+            try:
+                with open(tmp, "w") as handle:
+                    json.dump(data, handle, default=str, allow_nan=True)
+                    handle.flush()
+                    try:
+                        os.fsync(handle.fileno())
+                    except OSError:
+                        pass
+                os.replace(tmp, path)
+            except Exception:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+
+        class DebouncedProgressWriter:  # type: ignore[no-redef]
+            def __init__(self, path, min_interval_s=0.5):
+                self.path = path
+                self.min_interval_s = max(0.0, float(min_interval_s))
+                self._last_write = 0.0
+
+            def write(self, data, *, force=False):
+                now = time.monotonic()
+                if not force and now - self._last_write < self.min_interval_s:
+                    return False
+                _shared_atomic_json_write(self.path, data)
+                self._last_write = now
+                return True
+try:
+    from scripts.eval_policy import policy_metadata
+except Exception:
+    try:
+        from eval_policy import policy_metadata  # type: ignore
+    except Exception:
+        policy_metadata = None  # type: ignore
+
+# 2026-05-04: Suppress the spammy ``GenerationMixin`` warning that
+# transformers emits on EVERY ``model.generate()`` call when both
+# ``max_new_tokens`` and ``max_length`` are present in the merged
+# ``GenerationConfig``. We always pass ``max_new_tokens`` explicitly
+# (which takes precedence) and don't care about the ``max_length``
+# inherited from ``config.json``. Without this filter every probe
+# floods the eval log with ~50 identical lines per student, drowning
+# out the actual progress markers that the dashboard parses. The
+# filter is scoped tightly so any *new* generation warning still
+# surfaces.
+import logging
+import warnings
+warnings.filterwarnings(
+    "ignore",
+    message=r"Both `max_new_tokens`.*and `max_length`.*seem to have been set",
+    module=r"transformers\.generation\.utils",
+)
+try:
+    import transformers.generation.utils as _hf_genutils
+    _hf_genutils.logger.setLevel(logging.ERROR)
+except Exception:
+    pass
+warnings.filterwarnings(
+    "ignore",
+    message=r"Using the latest cached version of the dataset since",
+)
+for _noisy_logger in ("datasets", "datasets.builder", "datasets.load",
+                       "huggingface_hub", "huggingface_hub.file_download"):
+    try:
+        logging.getLogger(_noisy_logger).setLevel(logging.ERROR)
+    except Exception:
+        pass
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # §2  Constants
@@ -91,9 +231,25 @@ KL_CHUNK_SIZE = 128
 ACTIVATION_FP_SEED = 42
 ACTIVATION_FP_N_INPUTS = 5
 ACTIVATION_FP_SEQ_LEN = 64
+
+# Module-level teacher name. Populated once by main() after parsing
+# --teacher so helpers like load_model() can decide whether to enable
+# trust_remote_code without re-parsing args every call. Empty string
+# means "not yet set"; downstream code falls back to env / heuristic.
+TEACHER_NAME = ""
+def _default_fp_vocab() -> int:
+    """Return the teacher's ``configVocabSize`` as the activation-fingerprint
+    vocab default. Falls back to Qwen3.5's 248320 if the subnet-config can't
+    be imported (e.g. this script running outside the validator venv).
+    """
+    try:
+        from eval.runtime import TEACHER_CONFIG_VOCAB_SIZE as _v
+        return int(_v)
+    except Exception:
+        return 248320
 ACTIVATION_FP_VOCAB_SIZE = int(
-    os.environ.get("ACTIVATION_FP_VOCAB_SIZE", "248320")
-)  # default matches Qwen3.5; override on teacher swap
+    os.environ.get("ACTIVATION_FP_VOCAB_SIZE") or _default_fp_vocab()
+)  # derives from subnet-config.json; override via env for testing
 
 # -- vLLM server --
 VLLM_PORT = 9100
@@ -114,16 +270,162 @@ def gpu_mem_str():
     return "N/A"
 
 
+_POD_EMBED_KEYS = (
+    "model.embed_tokens.weight",
+    "model.language_model.embed_tokens.weight",
+    "language_model.model.embed_tokens.weight",
+    "transformer.wte.weight",
+)
+_POD_FLOAT_DTYPES = ("BF16", "F16", "F32", "F64", "F8_E4M3", "F8_E5M2")
+_POD_QUANT_TENSOR_MARKERS = (
+    ".absmax",
+    ".quant_map",
+    ".nested_absmax",
+    ".nested_quant_map",
+    ".quant_state.",
+    ".SCB",
+    ".weight_format",
+    ".g_idx",
+    "qweight",
+    "qzeros",
+    "scales",
+)
+
+
+def _pod_read_safetensors_header(session, url):
+    """Read a safetensors JSON header without downloading tensor data."""
+    import struct
+
+    pr = session.get(
+        url,
+        headers={"Range": "bytes=0-7"},
+        timeout=30,
+        stream=True,
+        allow_redirects=True,
+    )
+    pr.raise_for_status()
+    prefix = pr.raw.read(8)
+    pr.close()
+    if len(prefix) != 8:
+        return None
+    header_size = struct.unpack("<Q", prefix)[0]
+    if header_size <= 0 or header_size > 8_000_000:
+        return None
+    header_len = 8 + header_size
+    hr = session.get(
+        url,
+        headers={"Range": f"bytes=0-{header_len - 1}"},
+        timeout=60,
+        stream=True,
+        allow_redirects=True,
+    )
+    hr.raise_for_status()
+    blob = hr.raw.read(header_len)
+    hr.close()
+    return json.loads(blob[8:header_len].decode("utf-8"))
+
+
+def _pod_safetensor_files(model_repo, revision=None):
+    from huggingface_hub import HfApi
+
+    token = os.environ.get("HF_TOKEN") or None
+    info = HfApi(token=token).model_info(
+        repo_id=model_repo,
+        revision=revision,
+        files_metadata=True,
+    )
+    return sorted(
+        s.rfilename
+        for s in (info.siblings or [])
+        if getattr(s, "rfilename", "").endswith(".safetensors")
+    )
+
+
+def _pod_get_embed_weight_shape(model_repo, revision=None):
+    from huggingface_hub import hf_hub_url
+    import requests
+
+    st_files = _pod_safetensor_files(model_repo, revision)
+    if not st_files:
+        return None
+    with requests.Session() as session:
+        session.headers.update({"Accept-Encoding": "identity"})
+        for fname in st_files:
+            url = hf_hub_url(repo_id=model_repo, filename=fname, revision=revision)
+            header = _pod_read_safetensors_header(session, url)
+            if not header:
+                continue
+            for key in _POD_EMBED_KEYS:
+                if key in header:
+                    shape = header[key].get("shape") or []
+                    dtype = header[key].get("dtype") or "?"
+                    if len(shape) >= 2:
+                        return int(shape[0]), int(shape[1]), dtype
+    return None
+
+
+def _pod_detect_safetensors_quantization(model_repo, revision=None):
+    from huggingface_hub import hf_hub_url
+    import requests
+
+    st_files = _pod_safetensor_files(model_repo, revision)
+    if not st_files:
+        return None
+    with requests.Session() as session:
+        session.headers.update({"Accept-Encoding": "identity"})
+        url = hf_hub_url(repo_id=model_repo, filename=st_files[0], revision=revision)
+        header = _pod_read_safetensors_header(session, url)
+    if not header:
+        return None
+    for key in header:
+        if key == "__metadata__":
+            continue
+        lower = key.lower()
+        for marker in _POD_QUANT_TENSOR_MARKERS:
+            if marker in lower:
+                if "absmax" in marker or "quant_map" in marker:
+                    scheme = "bitsandbytes"
+                elif "qweight" in marker or "qzeros" in marker:
+                    scheme = "gptq/awq"
+                elif "scb" in marker:
+                    scheme = "bitsandbytes-int8"
+                else:
+                    scheme = "unknown_quant"
+                return {"quantized": True, "scheme": scheme, "marker": key}
+    return None
+
+
 def free_gpu():
-    """Free GPU memory: garbage collect, empty cache, synchronize."""
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    """Free GPU memory: garbage collect, empty cache, synchronize.
+
+    All CUDA calls are wrapped in try/except so that a previously-raised
+    device-side assertion (which poisons the CUDA context for the rest
+    of the process) cannot propagate out of cleanup and kill main(). A
+    poisoned context will fail every subsequent CUDA op anyway; surfacing
+    that as an unrecoverable exception here loses the eval results for
+    every still-pending student. We swallow the errors and let the
+    higher-level loop quarantine remaining students cleanly. See
+    distil-97 incident 2026-05-04: one student's vocab-OOB embed crash
+    killed the whole pod_eval process via free_gpu.empty_cache.
+    """
+    try:
+        gc.collect()
+    except Exception:
+        pass
+    if not torch.cuda.is_available():
+        return
+    for _name, _fn in (
+        ("empty_cache", torch.cuda.empty_cache),
+        ("ipc_collect", torch.cuda.ipc_collect),
+        ("synchronize", torch.cuda.synchronize),
+    ):
         try:
-            torch.cuda.ipc_collect()
-        except Exception:
-            pass
-        torch.cuda.synchronize()
+            _fn()
+        except Exception as _exc:
+            print(
+                f"  [free_gpu] {_name} skipped: {type(_exc).__name__}: {str(_exc)[:120]}",
+                flush=True,
+            )
 
 
 def ensure_disk_space(teacher_name, threshold=85):
@@ -195,21 +497,219 @@ def load_model(name, device="cuda", dtype=torch.bfloat16, revision=None):
     # rather than hardcoding "Qwen3.5". Falls back to the legacy
     # Qwen-substring check if the import fails (e.g. running the script
     # outside the validator venv).
+    # Detect "is this the teacher?" via several fallbacks so HF inference
+    # still works after a teacher swap, even on the pod where the local
+    # ``eval.runtime`` package isn't importable. Order:
+    #   1. Module-level TEACHER_NAME (set by main() once args are parsed)
+    #   2. eval.runtime import (works inside the validator venv)
+    #   3. Conservative teacher-name heuristic. Never classify generic
+    #      student DeepSeek/Kimi repo names as the teacher, because that
+    #      would enable trust_remote_code for untrusted submissions.
+    is_teacher = False
     try:
-        from eval.runtime import TEACHER_MODEL as _TEACHER_NAME
-        is_teacher = (name == _TEACHER_NAME) or (
-            "/" in name and name.split("/")[-1] == _TEACHER_NAME.split("/")[-1]
-        )
+        global TEACHER_NAME  # noqa: PLW0603
+        if TEACHER_NAME:
+            is_teacher = (name == TEACHER_NAME) or (
+                "/" in name and "/" in TEACHER_NAME and
+                name.split("/")[-1] == TEACHER_NAME.split("/")[-1]
+            )
     except Exception:
-        is_teacher = "Qwen" in name and ("35B" in name or "3.5" in name)
-    kwargs = dict(dtype=dtype, device_map=device, trust_remote_code=is_teacher)
+        pass
+    if not is_teacher:
+        try:
+            from eval.runtime import TEACHER_MODEL as _TEACHER_NAME
+            is_teacher = (name == _TEACHER_NAME) or (
+                "/" in name and name.split("/")[-1] == _TEACHER_NAME.split("/")[-1]
+            )
+        except Exception:
+            lname = name.lower()
+            is_teacher = (
+                ("qwen" in lname and ("35b" in lname or "3.5" in lname or "3.6" in lname))
+                or ("moonshotai" in lname and "kimi" in lname)
+            )
+    # Students must load with trust_remote_code=False. The validator
+    # allowlist now requires a native Transformers architecture
+    # (DeepseekV3ForCausalLM/model_type=deepseek_v3); custom Kimi wrapper
+    # code is not part of the student security boundary.
+    student_needs_remote_code = False
+    student_needs_eager_attn = False
+    if not is_teacher:
+        try:
+            _cfg_kwargs = {}
+            if revision and revision != "main":
+                _cfg_kwargs["revision"] = revision
+            from transformers import AutoConfig as _ACfg
+            _peek_cfg = _ACfg.from_pretrained(name, trust_remote_code=False, **_cfg_kwargs)
+            _archs = getattr(_peek_cfg, "architectures", None) or []
+            _model_type = getattr(_peek_cfg, "model_type", "")
+            # 2026-05-04: pod-side defensive embed/quant guard. This file
+            # is uploaded as a standalone script, so do not import
+            # eval.model_checker here; use the self-contained helpers above.
+            # A clean PRECHECK_BYPASS happens before AutoModel touches CUDA.
+            try:
+                _bvoc = int(
+                    os.environ.get("ACTIVATION_FP_VOCAB_SIZE")
+                    or os.environ.get("TEACHER_CONFIG_VOCAB_SIZE")
+                    or ACTIVATION_FP_VOCAB_SIZE
+                )
+                _eshape = _pod_get_embed_weight_shape(name, revision)
+                if _eshape is not None:
+                    _vsize, _hidden, _edt = _eshape
+                    _cfg_v = (
+                        getattr(_peek_cfg, "vocab_size", None)
+                        or (
+                            getattr(getattr(_peek_cfg, "text_config", None), "vocab_size", None)
+                            if hasattr(_peek_cfg, "text_config")
+                            else None
+                        )
+                    )
+                    _cfg_h = (
+                        getattr(_peek_cfg, "hidden_size", None)
+                        or (
+                            getattr(getattr(_peek_cfg, "text_config", None), "hidden_size", None)
+                            if hasattr(_peek_cfg, "text_config")
+                            else None
+                        )
+                    )
+                    if _vsize and _vsize != _bvoc:
+                        raise RuntimeError(
+                            f"PRECHECK_BYPASS: embed vocab {_vsize}"
+                            f" ≠ teacher {_bvoc}"
+                        )
+                    if _cfg_h and _hidden != int(_cfg_h):
+                        raise RuntimeError(
+                            f"PRECHECK_BYPASS: embed hidden {_hidden}"
+                            f" ≠ config hidden {int(_cfg_h)}"
+                        )
+                    if _edt and _edt.upper() not in _POD_FLOAT_DTYPES:
+                        raise RuntimeError(
+                            f"PRECHECK_BYPASS: embed dtype {_edt} is "
+                            f"not a float type"
+                        )
+                _qinfo = _pod_detect_safetensors_quantization(name, revision)
+                if _qinfo is not None:
+                    raise RuntimeError(
+                        f"PRECHECK_BYPASS: undisclosed quantization"
+                        f" ({_qinfo['scheme']} via {_qinfo['marker']})"
+                    )
+            except RuntimeError:
+                # Re-raise PRECHECK_BYPASS up to the caller so the eval
+                # loop logs it as a load failure (no CUDA touched).
+                raise
+            except Exception as _safe_err:
+                # Probe itself failed (network blip, weird format) — log
+                # but don't block. The validator-side precheck is the
+                # authoritative gate; this is just a fast-fail backstop.
+                print(
+                    f"  [pod-precheck] {name}: probe failed (non-fatal): "
+                    f"{_safe_err}",
+                    flush=True,
+                )
+            student_needs_remote_code = False
+            # 2026-05-03 (Kimi K2.6 cutover): DeepSeek-V3 / Kimi-family
+            # students use Multi-head Latent Attention (signalled by
+            # kv_lora_rank). cuDNN's SDPA fused backend has no execution
+            # plan for MLA's compressed-KV shapes, so the finetunability
+            # probe's forward pass dies with
+            # "cudnn_frontend Error: No valid execution plans built" and
+            # the student is wrongly DQ'd as anti-finetune. Forcing
+            # attn_implementation="eager" (math kernels) bypasses cuDNN
+            # entirely. This was already on for repo-name-detected Kimi
+            # models; we extend it to any MLA-style config.
+            _kv_lora = getattr(_peek_cfg, "kv_lora_rank", None)
+            student_needs_eager_attn = (
+                _model_type in ("deepseek_v3", "deepseek_v2", "kimi_k25", "kimi_k2")
+                or "DeepseekV3ForCausalLM" in _archs
+                or "DeepseekV2ForCausalLM" in _archs
+                or "KimiK25ForConditionalGeneration" in _archs
+                or (_kv_lora is not None and int(_kv_lora) > 0)
+            )
+        except Exception as _peek_err:
+            raise RuntimeError(
+                f"STUDENT_CONFIG_LOAD_FAILED_WITH_TRC_FALSE: {_peek_err}"
+            ) from _peek_err
+    trust_rc = is_teacher or student_needs_remote_code
+    kwargs = dict(dtype=dtype, device_map=device, trust_remote_code=trust_rc)
     if revision and revision != "main":
         kwargs["revision"] = revision
         print(f"  [model] Pinning to revision {revision[:12]}", flush=True)
 
+    # 2026-05-03 (Kimi K2.6 cutover): KimiK25ForConditionalGeneration's
+    # vision tower (MoonViT3dPretrainedModel) does not support
+    # flash_attention_2. transformers>=5.0 raises ValueError at __init__
+    # time (not load time) when any sub-module of the wrapper is missing
+    # FA2 support. Passing attn_implementation="eager" to from_pretrained
+    # only sets it on the *top-level* config; the Kimi model constructs
+    # MoonViT3dPretrainedModel(vt_config) with a separate config object
+    # that still defaults to FA2 on FA2-capable hardware.
+    #
+    # Fix: load the config first, force eager on ALL nested sub-configs
+    # (vision_config, text_config, etc.), then pass the patched config
+    # to from_pretrained so the vision tower init never attempts FA2.
+    lname = (name or "").lower()
+    # 2026-05-03: Kimi-family detection used to gate the eager-attention
+    # workaround; we extend it to fire for any student whose declared
+    # architecture / model_type is in the MLA family (DeepSeek-V3 / Kimi).
+    # Most miner students don't have "kimi" in the repo name; their config
+    # tells the truth, and student_needs_eager_attn captures that above.
+    is_kimi_family = (
+        ("moonshotai" in lname and "kimi" in lname)
+        or "kimi-k2" in lname
+        or "kimi_k2" in lname
+        or student_needs_remote_code
+        or student_needs_eager_attn
+    )
     max_retries = 3
     for attempt in range(max_retries):
         try:
+            if is_kimi_family:
+                from transformers import AutoConfig
+                # Students are always loaded with trust_remote_code=False.
+                # The validator allowlist only permits native DeepseekV3
+                # students; anything requiring custom Python is a security
+                # failure, not an eval fallback.
+                _cfg_kwargs = {"trust_remote_code": trust_rc}
+                if "revision" in kwargs:
+                    _cfg_kwargs["revision"] = kwargs["revision"]
+                config = AutoConfig.from_pretrained(
+                    name, attn_implementation="eager", **_cfg_kwargs
+                )
+                if not is_teacher:
+                    # Neutralize stale auto_map metadata so the native
+                    # DeepseekV3 loader is used without executing repo code.
+                    for attr in ("auto_map", "_auto_map"):
+                        try:
+                            if hasattr(config, attr):
+                                setattr(config, attr, None)
+                        except Exception:
+                            pass
+                    try:
+                        if hasattr(config, "text_config") and hasattr(config.text_config, "auto_map"):
+                            config.text_config.auto_map = None
+                    except Exception:
+                        pass
+                # Propagate eager to all nested sub-configs so
+                # MoonViT3dPretrainedModel.__init__ doesn't dispatch FA2.
+                def _force_eager(cfg):
+                    for attr in (
+                        "_attn_implementation",
+                        "_attn_implementation_internal",
+                        "_attn_implementation_autoset",
+                    ):
+                        try:
+                            setattr(cfg, attr, "eager")
+                        except Exception:
+                            pass
+                    for key in list(vars(cfg)):
+                        child = getattr(cfg, key, None)
+                        if child is not None and hasattr(child, "_attn_implementation"):
+                            _force_eager(child)
+                _force_eager(config)
+                m = AutoModelForCausalLM.from_pretrained(
+                    name, config=config, attn_implementation="eager", **kwargs
+                )
+                print(f"  [model] Loaded with eager (Kimi-family: FA2/SDPA not supported by vision tower)", flush=True)
+                return m
             try:
                 m = AutoModelForCausalLM.from_pretrained(name, attn_implementation="flash_attention_2", **kwargs)
                 print(f"  [model] Loaded with flash_attention_2", flush=True)
@@ -1131,7 +1631,7 @@ JUDGE_PROBE_POOL = (
     "What's a respectful way to disagree with a senior colleague's design choice? One short paragraph.",
     "Why is over-fitting in machine learning analogous to a student memorizing past exams? One short sentence.",
 )
-JUDGE_PROBE_PER_ROUND = int(os.environ.get("JUDGE_PROBE_PER_ROUND", "16"))
+JUDGE_PROBE_PER_ROUND = int(os.environ.get("JUDGE_PROBE_PER_ROUND", "20"))
 JUDGE_PROBE_MAX_TOKENS = int(os.environ.get("JUDGE_PROBE_MAX_TOKENS", "256"))
 
 # v30 (2026-04-29) — long_form_judge_probe. Same architecture as the short-
@@ -1142,8 +1642,30 @@ JUDGE_PROBE_MAX_TOKENS = int(os.environ.get("JUDGE_PROBE_MAX_TOKENS", "256"))
 # answers; nothing in the validator currently measures whether a model
 # can sustain a coherent multi-paragraph response, which is one of the
 # user-visible SOTA capabilities for assistant deployment.
-LONG_FORM_JUDGE_PER_ROUND = int(os.environ.get("LONG_FORM_JUDGE_PER_ROUND", "4"))
-LONG_FORM_JUDGE_MAX_TOKENS = int(os.environ.get("LONG_FORM_JUDGE_MAX_TOKENS", "1024"))
+# 2026-05-01 (v30.4 patch v3): bumped 4 → 8 prompts per round. With
+# only 4 prompts a derail on 1-2 of them only lowers coherence_factor
+# to ~0.5 (could still pass the 0.5 threshold). 8 prompts gives
+# tighter mean and exposes intermittent derailers (the king fails on
+# only some long-form prompts depending on topic). Doubles long-form
+# judge wall-clock per round (~30s → ~60s phase B), worth it.
+LONG_FORM_JUDGE_PER_ROUND = int(os.environ.get("LONG_FORM_JUDGE_PER_ROUND", "12"))
+# 2026-05-01 (v30.4 patch v2): raised 2048 → 6144 — essentially the
+# model's full usable context window minus prompt headroom. The
+# cap is asymmetric in cost:
+#   • Coherent models emit EOS at ~500-1000 tokens. Cost ≈ unchanged.
+#   • Derailed models never emit EOS and fill the full 6144 budget.
+#     They PAY for their derail in eval compute, which is exactly
+#     the right cost distribution.
+#   • Infinite-loop models hit the hard wall at 6144 instead of
+#     wasting an entire round budget.
+# The chat.arbos.life screenshot showed king UID 107 happily
+# generating word salad through 2000+ tokens even at temp=0.5,
+# so 2048 was still cutting most of the derail off. 6144 gives the
+# coherence detector a much longer signal window to work with —
+# a model that derails at 800 tokens scores ~0.05 across the
+# 5300-token derailed tail, vs maybe 0.4 on just the 1240-token
+# tail at the old 2048 cap.
+LONG_FORM_JUDGE_MAX_TOKENS = int(os.environ.get("LONG_FORM_JUDGE_MAX_TOKENS", "6144"))
 LONG_FORM_JUDGE_ENABLED = os.environ.get("LONG_FORM_JUDGE_PROBE", "1") != "0"
 LONG_FORM_JUDGE_IN_COMPOSITE = os.environ.get("LONG_FORM_JUDGE_IN_COMPOSITE", "1") != "0"
 # Env gate: off by default would hide the shadow data, which defeats the
@@ -1235,6 +1757,40 @@ _LONG_FORM_JUDGE_TEMPLATES = (
     "Write a 350-500 word advice piece on {topic}. Open with a clear "
     "statement of the situation, give two-three concrete steps in the "
     "body, and close with a short summary.",
+    # ─────────────────────────────────────────────────────────────────
+    # 2026-05-01 (v30.4 patch v4): four longer-stretch coherence-stress
+    # templates that match common chat patterns where derailment shows
+    # up most often. These ask for 600-1000 words across 4-6 distinct
+    # sections so the model must maintain coherence well past the
+    # ~500-word threshold where small distilled models tend to break
+    # down. The dedicated long_gen_coherence axis treats output below
+    # ~0.30 coherence as a hard DQ; these templates SURFACE that
+    # failure mode every round, so a model that derails on chat users
+    # also derails on the eval and gets DQ'd accordingly.
+    "Write a comprehensive 600-900 word essay on {topic} structured "
+    "as four distinct sections: (1) a one-paragraph introduction "
+    "stating the central question, (2) two body paragraphs developing "
+    "the main argument, (3) one paragraph examining a counter-view, "
+    "(4) a closing paragraph synthesising the discussion. Use clear "
+    "topic sentences and natural transitions between sections.",
+    "Provide a step-by-step reasoning piece (700-1000 words, 5-6 "
+    "paragraphs) that walks through {topic} from first principles. "
+    "Open with definitions, then build up the core argument over "
+    "three body paragraphs (each making one distinct point with a "
+    "concrete example), then close with implications. Maintain a "
+    "consistent register and avoid restating the same point twice.",
+    "Write a 600-800 word narrative reflection on {topic}. Begin "
+    "with a specific scene (one paragraph), develop the central "
+    "tension over two body paragraphs, introduce a complicating "
+    "perspective in a fourth paragraph, and close with a takeaway. "
+    "Keep the voice consistent throughout and use natural prose "
+    "rather than bullet points.",
+    "Compose a Fermi-style estimation answer to a quantitative "
+    "question about {topic} in 500-700 words and 4-5 paragraphs. "
+    "State the question clearly, list assumptions in one paragraph, "
+    "show two-three estimation steps in separate paragraphs (with "
+    "intermediate numerical reasoning), and close with the final "
+    "estimate plus a sentence on how confident you are.",
 )
 
 # Topic phrases procedurally rotated. Mostly content-domain neutral so
@@ -1387,10 +1943,10 @@ def judge_response_probe(model, tokenizer, device="cuda"):
     Stores ``{'prompts': [...], 'responses': [...], 'gen_tokens': [...]}``
     in a dict; caller stashes it in the module-level _JUDGE_ROLLOUTS so
     Phase B (teacher scoring) can consume it after the student is
-    unloaded. The student-side generation is deliberately the same shape
-    as the chat-probe: greedy, ``enable_thinking=False``, bounded max
-    tokens. This matches the "user types a question and gets a response"
-    deployment usage the judge axis is approximating.
+    unloaded. The student-side generation is deliberately chat-shaped:
+    greedy, bounded max tokens, and honoring the global bench thinking
+    policy. This matches the deployed "user types a question and gets a
+    response" usage the judge axis is approximating.
     """
     out = {
         "prompts": list(JUDGE_PROBE_PROMPTS),
@@ -1401,41 +1957,76 @@ def judge_response_probe(model, tokenizer, device="cuda"):
         return out
     if not getattr(tokenizer, "chat_template", None):
         return out
-    eos_ids = []
-    for tok in ("<|im_end|>", "<|endoftext|>"):
-        tid = tokenizer.convert_tokens_to_ids(tok)
-        if isinstance(tid, int) and tid >= 0:
-            eos_ids.append(tid)
-    if getattr(tokenizer, "eos_token_id", None) is not None:
-        eos_ids.append(int(tokenizer.eos_token_id))
-    eos_ids = list(set(eos_ids)) or None
-    pad_id = getattr(tokenizer, "pad_token_id", None)
-    if pad_id is None:
-        pad_id = eos_ids[0] if eos_ids else 0
-    was_training = model.training
-    model.eval()
-    try:
-        with torch.no_grad():
-            for prompt in JUDGE_PROBE_PROMPTS:
-                try:
-                    rendered = _render_chat_prompt(tokenizer, prompt, enable_thinking=False)
-                    ids = tokenizer(rendered, return_tensors="pt").input_ids.to(device)
-                    gen = model.generate(
-                        ids, max_new_tokens=JUDGE_PROBE_MAX_TOKENS,
-                        do_sample=False, temperature=1.0, top_p=1.0,
-                        pad_token_id=pad_id, eos_token_id=eos_ids, use_cache=True,
-                    )
-                    new_ids = gen[0, ids.shape[1]:]
-                    text = tokenizer.decode(new_ids, skip_special_tokens=True)
-                    out["responses"].append(_strip_thinking_probe(text))
-                    out["gen_tokens"].append(int(new_ids.shape[0]))
-                except Exception as e:
-                    out["responses"].append("")
-                    out["gen_tokens"].append(0)
-                    print(f"[judge-probe] student gen error: {str(e)[:120]}", flush=True)
-    finally:
-        if was_training:
-            model.train()
+    eos_ids, pad_id = _eos_pad_ids(tokenizer)
+    with _model_eval_no_grad(model):
+        for prompt in JUDGE_PROBE_PROMPTS:
+            try:
+                rendered = _render_chat_prompt(
+                    tokenizer, prompt, enable_thinking=BENCH_ENABLE_THINKING,
+                )
+                ids = tokenizer(rendered, return_tensors="pt").input_ids.to(device)
+                gen = model.generate(
+                    ids, max_new_tokens=JUDGE_PROBE_MAX_TOKENS,
+                    do_sample=False, temperature=1.0, top_p=1.0,
+                    pad_token_id=pad_id, eos_token_id=eos_ids, use_cache=True,
+                )
+                new_ids = gen[0, ids.shape[1]:]
+                text = tokenizer.decode(new_ids, skip_special_tokens=True)
+                out["responses"].append(_strip_thinking_probe(text))
+                out["gen_tokens"].append(int(new_ids.shape[0]))
+            except Exception as e:
+                out["responses"].append("")
+                out["gen_tokens"].append(0)
+                print(f"[judge-probe] student gen error: {str(e)[:120]}", flush=True)
+    return out
+
+
+def long_form_judge_response_probe(
+    model, tokenizer, device="cuda", max_tokens_override: int | None = None,
+):
+    """Collect student responses for the long-form judge axis.
+
+    Phase B scores these stored responses after the student is unloaded, so
+    this mirrors ``judge_response_probe`` but uses the long-form prompt pool and
+    the long-form token budget.
+    """
+    out = {
+        "prompts": list(LONG_FORM_JUDGE_PROMPTS),
+        "responses": [],
+        "gen_tokens": [],
+    }
+    if tokenizer is None or model is None or not LONG_FORM_JUDGE_PROMPTS:
+        return out
+    if not getattr(tokenizer, "chat_template", None):
+        return out
+
+    max_new = (
+        int(max_tokens_override)
+        if max_tokens_override is not None
+        else int(LONG_FORM_JUDGE_MAX_TOKENS)
+    )
+    max_new = max(64, max_new)
+    eos_ids, pad_id = _eos_pad_ids(tokenizer)
+    with _model_eval_no_grad(model):
+        for prompt in LONG_FORM_JUDGE_PROMPTS:
+            try:
+                rendered = _render_chat_prompt(
+                    tokenizer, prompt, enable_thinking=BENCH_ENABLE_THINKING,
+                )
+                ids = tokenizer(rendered, return_tensors="pt").input_ids.to(device)
+                gen = model.generate(
+                    ids, max_new_tokens=max_new,
+                    do_sample=False, temperature=1.0, top_p=1.0,
+                    pad_token_id=pad_id, eos_token_id=eos_ids, use_cache=True,
+                )
+                new_ids = gen[0, ids.shape[1]:]
+                text = tokenizer.decode(new_ids, skip_special_tokens=True)
+                out["responses"].append(_strip_thinking_probe(text))
+                out["gen_tokens"].append(int(new_ids.shape[0]))
+            except Exception as e:
+                out["responses"].append("")
+                out["gen_tokens"].append(0)
+                print(f"[long-form-judge] student gen error: {str(e)[:120]}", flush=True)
     return out
 
 
@@ -1569,6 +2160,288 @@ def _sanitize_grader_response(text: str) -> str:
     return out
 
 
+def _finalize_digit_rubric_aggregate(
+    agg: dict, scores: "list[int | None]",
+) -> None:
+    """Fill ``mean_score`` + ``normalized`` from non-``None`` rubric scores.
+
+    The same 5-line block ran inline at the bottom of every digit-rubric
+    teacher scorer (judge × 2, long-form judge × 2, chat-turns × 2).
+    Centralising it removes ~25 LOC and means a future rubric-scale
+    change (e.g. 1-5 → 1-7) only needs one edit. Mutates ``agg`` in
+    place to match the historical call-site shape.
+    """
+    valid = [s for s in scores if s is not None]
+    if not valid:
+        return
+    mean = sum(valid) / len(valid)
+    agg["mean_score"] = round(mean, 3)
+    agg["normalized"] = round(max(0.0, min(1.0, (mean - 1.0) / 4.0)), 4)
+
+
+def _apply_lfj_derail_and_termination_penalty(
+    agg: dict, *,
+    responses: "list[str]",
+    scores: "list[int | None]",
+    gen_tokens_list: "list[int | None]",
+    max_tokens: int = None,  # type: ignore[assignment]
+) -> None:
+    """Multiply LFJ rubric grade by per-prompt coherence × termination.
+
+    The block was duplicated verbatim between
+    :func:`long_form_judge_teacher_score` (local) and
+    :func:`long_form_judge_teacher_score_api` (API). Centralising
+    guarantees the local and API teacher modes produce directly
+    comparable axis values.
+
+    For each scored response we compute:
+
+      * ``coh = _coherence_factor(response)``  — gibberish / word-salad
+        detector (returns [0, 1]; see :func:`_coherence_factor`).
+      * ``term`` — natural-termination factor: 1.0 if the model emitted
+        EOS before 95% of the budget, 0.5 if it filled the budget,
+        linearly interpolated in between. Models that fill ``max_tokens``
+        are either derailed or never knew when to stop.
+
+    ``coh × term`` becomes the per-prompt penalty. The mean across
+    prompts multiplies ``agg["normalized"]``; the original value is
+    preserved as ``normalized_pre_coherence`` so dashboards can show
+    "rubric grade" vs "rubric grade after derail penalty" side-by-side.
+    """
+    if max_tokens is None:
+        max_tokens = LONG_FORM_JUDGE_MAX_TOKENS
+    derail_factors: list[float] = []
+    term_factors: list[float] = []
+    for i, response in enumerate(responses):
+        if i >= len(scores) or scores[i] is None:
+            continue
+        coh = _coherence_factor(response or "")
+        gen_len = (
+            int(gen_tokens_list[i])
+            if i < len(gen_tokens_list) and gen_tokens_list[i] is not None
+            else max_tokens
+        )
+        if max_tokens <= 0:
+            term = 1.0
+        elif gen_len < int(max_tokens * 0.95):
+            term = 1.0
+        elif gen_len >= max_tokens:
+            term = 0.5
+        else:
+            term = 1.0 - (
+                (gen_len - int(max_tokens * 0.95))
+                / max(1, int(max_tokens * 0.05))
+            ) * 0.5
+        term = max(0.5, min(1.0, term))
+        term_factors.append(term)
+        derail_factors.append(coh * term)
+        if i < len(agg["per_prompt"]):
+            agg["per_prompt"][i]["coherence"] = round(coh, 3)
+            agg["per_prompt"][i]["termination"] = round(term, 3)
+            agg["per_prompt"][i]["gen_tokens"] = gen_len
+    if not derail_factors:
+        return
+    coh_mean = sum(derail_factors) / len(derail_factors)
+    agg["coherence_factor"] = round(coh_mean, 3)
+    if term_factors:
+        agg["termination_factor"] = round(
+            sum(term_factors) / len(term_factors), 3,
+        )
+    if agg.get("normalized") is not None:
+        agg["normalized_pre_coherence"] = agg["normalized"]
+        agg["normalized"] = round(agg["normalized"] * coh_mean, 4)
+
+
+def _api_teacher_greedy():
+    """Single import point for ``api_teacher._greedy_text_one``.
+
+    The teacher API helper module is shipped alongside this script on
+    the eval pod, so direct package-style imports may not resolve when
+    pod_eval_vllm runs as a top-level script. Both ``scripts.api_teacher``
+    and ``api_teacher`` are tried in order.
+    """
+    try:
+        from scripts.api_teacher import _greedy_text_one  # type: ignore
+    except ImportError:
+        from api_teacher import _greedy_text_one  # type: ignore
+    return _greedy_text_one
+
+
+def _teacher_rubric_local(
+    *,
+    teacher,
+    tokenizer,
+    device: str,
+    items: list,
+    build_rubric,
+    record_extras,
+    max_input_len: int = 4096,
+    max_new_tokens: int = 8,
+) -> "tuple[list[int | None], list[dict]]":
+    """Run a local-HF digit-rubric grading pass over ``items``.
+
+    Each item is rendered via ``build_rubric(item) -> str`` (the rubric
+    template + the formatted (prompt, response) / transcript), tokenised
+    with truncation at ``max_input_len``, fed to the teacher under
+    ``_model_eval_no_grad`` for an 8-token greedy completion, and
+    finally parsed with :func:`_parse_judge_score`.
+
+    ``record_extras(item) -> dict`` returns per-item dashboard fields
+    that vary by axis (``prompt`` / ``response_preview`` for judges,
+    ``seed`` for chat-turns).
+
+    Returns ``(scores, records)`` aligned 1:1 with ``items``: ``scores[i]``
+    is ``None`` on parse failure / exception, ``records[i]`` always has
+    the extras + ``raw`` + ``score`` and on exception adds ``error``.
+    """
+    eos_ids, pad_id = _eos_pad_ids(tokenizer)
+    scores: list[int | None] = []
+    records: list[dict] = []
+    with _model_eval_no_grad(teacher):
+        for item in items:
+            try:
+                rubric = build_rubric(item)
+                rendered = _render_chat_prompt(
+                    tokenizer, rubric, enable_thinking=False,
+                )
+                ids = tokenizer(
+                    rendered, return_tensors="pt",
+                    truncation=True, max_length=max_input_len,
+                ).input_ids.to(device)
+                gen = teacher.generate(
+                    ids, max_new_tokens=max_new_tokens,
+                    do_sample=False, temperature=1.0, top_p=1.0,
+                    pad_token_id=pad_id, eos_token_id=eos_ids, use_cache=True,
+                )
+                new_ids = gen[0, ids.shape[1]:]
+                text = tokenizer.decode(new_ids, skip_special_tokens=True)
+                score = _parse_judge_score(text)
+                scores.append(score)
+                records.append({
+                    **record_extras(item),
+                    "raw": text[:24],
+                    "score": score,
+                })
+            except Exception as e:
+                scores.append(None)
+                records.append({
+                    **record_extras(item),
+                    "error": str(e)[:120],
+                    "score": None,
+                })
+    return scores, records
+
+
+def _teacher_rubric_api(
+    *,
+    api_cfg,
+    tokenizer,
+    items: list,
+    build_rubric,
+    record_extras,
+    concurrency: int = 4,
+    max_new_tokens: int = 8,
+) -> "tuple[list[int | None], list[dict]]":
+    """API-routed counterpart of :func:`_teacher_rubric_local`.
+
+    Same call shape, but the per-item rubric forward fans out via
+    ``ThreadPoolExecutor`` against the OpenAI-compatible teacher API
+    (Kimi K2.6 via OpenRouter → Inceptron in production).
+    Concurrency defaults to 4 to stay under the Inceptron rate-limit
+    bucket. Indices are preserved so per-item alignment with ``items``
+    is identical to the local path.
+    """
+    greedy_text_one = _api_teacher_greedy()
+
+    def _grade_one(idx_pair):
+        idx, item = idx_pair
+        try:
+            rubric = build_rubric(item)
+            rendered = _render_chat_prompt(
+                tokenizer, rubric, enable_thinking=False,
+            )
+            text = greedy_text_one(
+                rendered, api_cfg, max_new_tokens=max_new_tokens, idx=idx,
+            )
+            score = _parse_judge_score(text)
+            return idx, item, text, score, None
+        except Exception as e:
+            return idx, item, "", None, e
+
+    indexed = list(enumerate(items))
+    grade_results: dict[int, tuple] = {}
+    with ThreadPoolExecutor(max_workers=max(1, concurrency)) as ex:
+        for fut in ex.map(_grade_one, indexed):
+            i, item, text, score, err = fut
+            grade_results[i] = (item, text, score, err)
+
+    scores: list[int | None] = []
+    records: list[dict] = []
+    for i in range(len(indexed)):
+        item, text, score, err = grade_results[i]
+        scores.append(score)
+        rec = {
+            **record_extras(item),
+            "raw": text[:24],
+            "score": score,
+        }
+        if err is not None:
+            rec["error"] = str(err)[:120]
+            rec["score"] = None
+        records.append(rec)
+    return scores, records
+
+
+def _build_judge_rubric(item: tuple) -> str:
+    prompt, response = item
+    return JUDGE_RUBRIC_TEMPLATE.format(
+        prompt=prompt.strip(),
+        response=_sanitize_grader_response((response or "").strip())[:2048],
+    )
+
+
+def _build_lfj_rubric(item: tuple) -> str:
+    prompt, response = item
+    return LONG_FORM_JUDGE_RUBRIC_TEMPLATE.format(
+        prompt=prompt.strip(),
+        response=_sanitize_grader_response((response or "").strip())[:4096],
+    )
+
+
+def _judge_record_extras(item: tuple) -> dict:
+    prompt, response = item
+    return {"prompt": prompt[:160], "response_preview": (response or "")[:120]}
+
+
+def _finalize_judge_agg(agg: dict, scores: list, records: list, key: str) -> dict:
+    """Stamp the per-item ``records`` onto ``agg[key]`` and refresh
+    ``n`` / ``n_valid`` + the 1..5 → 0..1 footer.
+
+    Used by every teacher rubric scorer (judge / LFJ / chat-turns,
+    local + API) so the four trailing lines stay in lockstep.
+    """
+    agg[key] = records
+    agg["n"] = len(records)
+    agg["n_valid"] = sum(1 for s in scores if s is not None)
+    _finalize_digit_rubric_aggregate(agg, scores)
+    return agg
+
+
+def _judge_rubric_inputs(collected: dict) -> "list[tuple] | None":
+    """Pull (prompts, responses) zipped items out of the rollout dict.
+
+    Returns ``None`` if the rollout is missing or has no usable rows;
+    the caller then short-circuits with the empty agg.
+    """
+    if not collected:
+        return None
+    prompts = collected.get("prompts") or []
+    responses = collected.get("responses") or []
+    if not prompts or not responses:
+        return None
+    return list(zip(prompts, responses))
+
+
 def judge_teacher_score(teacher, tokenizer, collected: dict, device: str = "cuda") -> dict:
     """Score a student's collected responses with the teacher as judge.
 
@@ -1579,136 +2452,65 @@ def judge_teacher_score(teacher, tokenizer, collected: dict, device: str = "cuda
     returned alongside the raw list so the dashboard can show the
     distribution.
     """
-    agg = {
-        "n": 0, "n_valid": 0, "mean_score": None,
-        "normalized": None, "per_prompt": [],
-    }
-    if teacher is None or tokenizer is None or not collected:
+    agg = {"n": 0, "n_valid": 0, "mean_score": None,
+           "normalized": None, "per_prompt": []}
+    if teacher is None or tokenizer is None:
         return agg
-    prompts = collected.get("prompts") or []
-    responses = collected.get("responses") or []
-    if not prompts or not responses:
+    items = _judge_rubric_inputs(collected)
+    if items is None:
         return agg
-    eos_ids = []
-    for tok in ("<|im_end|>", "<|endoftext|>"):
-        tid = tokenizer.convert_tokens_to_ids(tok)
-        if isinstance(tid, int) and tid >= 0:
-            eos_ids.append(tid)
-    if getattr(tokenizer, "eos_token_id", None) is not None:
-        eos_ids.append(int(tokenizer.eos_token_id))
-    eos_ids = list(set(eos_ids)) or None
-    pad_id = getattr(tokenizer, "pad_token_id", None)
-    if pad_id is None:
-        pad_id = eos_ids[0] if eos_ids else 0
-    was_training = teacher.training
-    teacher.eval()
-    scores: list[int | None] = []
-    try:
-        with torch.no_grad():
-            for prompt, response in zip(prompts, responses):
-                agg["n"] += 1
-                try:
-                    rubric = JUDGE_RUBRIC_TEMPLATE.format(
-                        prompt=prompt.strip(),
-                        response=_sanitize_grader_response(
-                            (response or "").strip()
-                        )[:2048],
-                    )
-                    rendered = _render_chat_prompt(tokenizer, rubric, enable_thinking=False)
-                    ids = tokenizer(rendered, return_tensors="pt",
-                                    truncation=True, max_length=4096).input_ids.to(device)
-                    gen = teacher.generate(
-                        ids, max_new_tokens=8,
-                        do_sample=False, temperature=1.0, top_p=1.0,
-                        pad_token_id=pad_id, eos_token_id=eos_ids, use_cache=True,
-                    )
-                    new_ids = gen[0, ids.shape[1]:]
-                    text = tokenizer.decode(new_ids, skip_special_tokens=True)
-                    score = _parse_judge_score(text)
-                    scores.append(score)
-                    agg["per_prompt"].append({
-                        "prompt": prompt[:160],
-                        "response_preview": (response or "")[:120],
-                        "raw": text[:24],
-                        "score": score,
-                    })
-                    if score is not None:
-                        agg["n_valid"] += 1
-                except Exception as e:
-                    scores.append(None)
-                    agg["per_prompt"].append({
-                        "prompt": prompt[:160],
-                        "error": str(e)[:120],
-                        "score": None,
-                    })
-    finally:
-        if was_training:
-            teacher.train()
-    valid = [s for s in scores if s is not None]
-    if valid:
-        mean = sum(valid) / len(valid)
-        agg["mean_score"] = round(mean, 3)
-        agg["normalized"] = round(max(0.0, min(1.0, (mean - 1.0) / 4.0)), 4)
-    return agg
+    scores, records = _teacher_rubric_local(
+        teacher=teacher, tokenizer=tokenizer, device=device,
+        items=items,
+        build_rubric=_build_judge_rubric,
+        record_extras=_judge_record_extras,
+        max_input_len=4096,
+    )
+    return _finalize_judge_agg(agg, scores, records, "per_prompt")
 
 
-def long_form_judge_response_probe(model, tokenizer, device="cuda"):
-    """v30 — collect greedy student responses to long-form essay prompts.
+def judge_teacher_score_api(api_cfg, tokenizer, collected: dict,
+                             concurrency: int = 4) -> dict:
+    """API-routed equivalent of :func:`judge_teacher_score`.
 
-    Same shape as ``judge_response_probe`` but uses
-    ``LONG_FORM_JUDGE_PROMPTS`` and ``LONG_FORM_JUDGE_MAX_TOKENS``
-    so the student has room to produce a 300-500 word response.
-    Greedy decoding (deterministic across validators given the same
-    block_seed → same prompt set).
+    Replaces the local ``teacher.generate(...)`` call with a request
+    to the OpenAI-compatible teacher API (Kimi K2.6 via OpenRouter →
+    Inceptron in production). Same returned shape so the caller code
+    is identical.
 
-    Phase A only. The collected responses are stashed in
-    ``_LONG_FORM_JUDGE_ROLLOUTS`` for Phase B teacher scoring.
+    Why this exists
+    ---------------
+    Pre-2026-05-04 Phase B always loaded the local teacher onto GPU
+    via ``load_model(args.teacher, device)`` to run rubric grading.
+    After the API teacher cutover (2026-05-03) the teacher is Kimi
+    K2.6 1T-param sparse MoE — ~600 GB disk, >1 TB VRAM at bf16,
+    won't fit on H200 NVL's 140 GB. So Phase B silently failed every
+    round, dropping judge / chat-turns / long-form-judge scores from
+    the composite. This function (and its long-form / chat-turns
+    siblings below) routes the rubric grading through the same API
+    that already serves Phase A logprobs, so Phase B can run without
+    ever touching the local GPU.
+
+    Parallelism: each (prompt, response) → single-digit grade is
+    independent, so we fan out via ThreadPoolExecutor. Concurrency
+    defaults to 4 to stay under the Inceptron rate-limit bucket
+    (the same per-second budget as the Phase A logprob fetcher).
     """
-    out = {
-        "prompts": list(LONG_FORM_JUDGE_PROMPTS),
-        "responses": [],
-        "gen_tokens": [],
-    }
-    if tokenizer is None or model is None or not LONG_FORM_JUDGE_PROMPTS:
-        return out
-    if not getattr(tokenizer, "chat_template", None):
-        return out
-    eos_ids = []
-    for tok in ("<|im_end|>", "<|endoftext|>"):
-        tid = tokenizer.convert_tokens_to_ids(tok)
-        if isinstance(tid, int) and tid >= 0:
-            eos_ids.append(tid)
-    if getattr(tokenizer, "eos_token_id", None) is not None:
-        eos_ids.append(int(tokenizer.eos_token_id))
-    eos_ids = list(set(eos_ids)) or None
-    pad_id = getattr(tokenizer, "pad_token_id", None)
-    if pad_id is None:
-        pad_id = eos_ids[0] if eos_ids else 0
-    was_training = model.training
-    model.eval()
-    try:
-        with torch.no_grad():
-            for prompt in LONG_FORM_JUDGE_PROMPTS:
-                try:
-                    rendered = _render_chat_prompt(tokenizer, prompt, enable_thinking=False)
-                    ids = tokenizer(rendered, return_tensors="pt").input_ids.to(device)
-                    gen = model.generate(
-                        ids, max_new_tokens=LONG_FORM_JUDGE_MAX_TOKENS,
-                        do_sample=False, temperature=1.0, top_p=1.0,
-                        pad_token_id=pad_id, eos_token_id=eos_ids, use_cache=True,
-                    )
-                    new_ids = gen[0, ids.shape[1]:]
-                    text = tokenizer.decode(new_ids, skip_special_tokens=True)
-                    out["responses"].append(_strip_thinking_probe(text))
-                    out["gen_tokens"].append(int(new_ids.shape[0]))
-                except Exception as e:
-                    out["responses"].append("")
-                    out["gen_tokens"].append(0)
-                    print(f"[long-form-judge] student gen error: {str(e)[:120]}", flush=True)
-    finally:
-        if was_training:
-            model.train()
-    return out
+    agg = {"n": 0, "n_valid": 0, "mean_score": None,
+           "normalized": None, "per_prompt": []}
+    if api_cfg is None or tokenizer is None:
+        return agg
+    items = _judge_rubric_inputs(collected)
+    if items is None:
+        return agg
+    scores, records = _teacher_rubric_api(
+        api_cfg=api_cfg, tokenizer=tokenizer,
+        items=items,
+        build_rubric=_build_judge_rubric,
+        record_extras=_judge_record_extras,
+        concurrency=concurrency,
+    )
+    return _finalize_judge_agg(agg, scores, records, "per_prompt")
 
 
 def long_form_judge_teacher_score(teacher, tokenizer, collected: dict,
@@ -1727,81 +2529,261 @@ def long_form_judge_teacher_score(teacher, tokenizer, collected: dict,
     therefore dominated by the response-collection pass (Phase A),
     not the rubric pass (Phase B) — typical ~6s/student for 4 long
     prompts vs <1s for the teacher rubric.
+
+    Input is capped at 6144 tokens to stay safely under the teacher's
+    8192 context cap on a 4-paragraph response.
     """
-    agg = {
-        "n": 0, "n_valid": 0, "mean_score": None,
-        "normalized": None, "per_prompt": [],
-    }
-    if teacher is None or tokenizer is None or not collected:
+    agg = {"n": 0, "n_valid": 0, "mean_score": None,
+           "normalized": None, "per_prompt": []}
+    if teacher is None or tokenizer is None:
         return agg
-    prompts = collected.get("prompts") or []
-    responses = collected.get("responses") or []
-    if not prompts or not responses:
+    items = _judge_rubric_inputs(collected)
+    if items is None:
         return agg
-    eos_ids = []
-    for tok in ("<|im_end|>", "<|endoftext|>"):
-        tid = tokenizer.convert_tokens_to_ids(tok)
-        if isinstance(tid, int) and tid >= 0:
-            eos_ids.append(tid)
-    if getattr(tokenizer, "eos_token_id", None) is not None:
-        eos_ids.append(int(tokenizer.eos_token_id))
-    eos_ids = list(set(eos_ids)) or None
-    pad_id = getattr(tokenizer, "pad_token_id", None)
-    if pad_id is None:
-        pad_id = eos_ids[0] if eos_ids else 0
-    was_training = teacher.training
-    teacher.eval()
-    scores: list[int | None] = []
-    try:
-        with torch.no_grad():
-            for prompt, response in zip(prompts, responses):
-                agg["n"] += 1
-                try:
-                    rubric = LONG_FORM_JUDGE_RUBRIC_TEMPLATE.format(
-                        prompt=prompt.strip(),
-                        response=_sanitize_grader_response(
-                            (response or "").strip()
-                        )[:4096],
-                    )
-                    rendered = _render_chat_prompt(tokenizer, rubric, enable_thinking=False)
-                    # Cap rubric prompt at 6144 input tokens to stay
-                    # safely under the teacher's 8192 context cap on a
-                    # 4-paragraph response.
-                    ids = tokenizer(rendered, return_tensors="pt",
-                                    truncation=True, max_length=6144).input_ids.to(device)
-                    gen = teacher.generate(
-                        ids, max_new_tokens=8,
-                        do_sample=False, temperature=1.0, top_p=1.0,
-                        pad_token_id=pad_id, eos_token_id=eos_ids, use_cache=True,
-                    )
-                    new_ids = gen[0, ids.shape[1]:]
-                    text = tokenizer.decode(new_ids, skip_special_tokens=True)
-                    score = _parse_judge_score(text)
-                    scores.append(score)
-                    agg["per_prompt"].append({
-                        "prompt": prompt[:160],
-                        "response_preview": (response or "")[:120],
-                        "raw": text[:24],
-                        "score": score,
-                    })
-                    if score is not None:
-                        agg["n_valid"] += 1
-                except Exception as e:
-                    scores.append(None)
-                    agg["per_prompt"].append({
-                        "prompt": prompt[:160],
-                        "error": str(e)[:120],
-                        "score": None,
-                    })
-    finally:
-        if was_training:
-            teacher.train()
-    valid = [s for s in scores if s is not None]
-    if valid:
-        mean = sum(valid) / len(valid)
-        agg["mean_score"] = round(mean, 3)
-        agg["normalized"] = round(max(0.0, min(1.0, (mean - 1.0) / 4.0)), 4)
+    scores, records = _teacher_rubric_local(
+        teacher=teacher, tokenizer=tokenizer, device=device,
+        items=items,
+        build_rubric=_build_lfj_rubric,
+        record_extras=_judge_record_extras,
+        max_input_len=6144,
+    )
+    _finalize_judge_agg(agg, scores, records, "per_prompt")
+    _apply_lfj_derail_and_termination_penalty(
+        agg,
+        responses=collected.get("responses") or [],
+        scores=scores,
+        gen_tokens_list=collected.get("gen_tokens") or [],
+    )
     return agg
+
+
+def long_form_judge_teacher_score_api(api_cfg, tokenizer, collected: dict,
+                                       concurrency: int = 4) -> dict:
+    """API-routed equivalent of :func:`long_form_judge_teacher_score`.
+
+    Same routing rationale as :func:`judge_teacher_score_api` — Phase B
+    rubric grading must work in API mode after the Kimi K2.6 cutover.
+
+    Preserves the post-rubric coherence × termination derail
+    penalisation block. The per-prompt heuristic detection runs on
+    the student response text (already in ``collected``) so the
+    detector itself doesn't need the teacher at all — it's gated only
+    on the rubric grade being non-None, which is the exact same
+    condition the local-teacher version uses.
+    """
+    agg = {"n": 0, "n_valid": 0, "mean_score": None,
+           "normalized": None, "per_prompt": []}
+    if api_cfg is None or tokenizer is None:
+        return agg
+    items = _judge_rubric_inputs(collected)
+    if items is None:
+        return agg
+    scores, records = _teacher_rubric_api(
+        api_cfg=api_cfg, tokenizer=tokenizer,
+        items=items,
+        build_rubric=_build_lfj_rubric,
+        record_extras=_judge_record_extras,
+        concurrency=concurrency,
+    )
+    _finalize_judge_agg(agg, scores, records, "per_prompt")
+    _apply_lfj_derail_and_termination_penalty(
+        agg,
+        responses=collected.get("responses") or [],
+        scores=scores,
+        gen_tokens_list=collected.get("gen_tokens") or [],
+    )
+    return agg
+
+
+def _coherence_factor(text: str) -> float:
+    """Return a [0, 1] coherence factor for a long-form response.
+
+    1.0 = clean coherent prose (no derail signals).
+    0.0 = pure gibberish / word salad.
+
+    Detector signals (multiplied together):
+
+      * ``non_ascii_factor``  — 1 - clip(non_ascii_frac × 4, 0, 1).
+        At 0% non-ASCII this is 1.0; at ≥25% it's 0.0. Targets
+        the multilingual-word-salad failure mode (Latin → CJK /
+        Cyrillic mid-sentence).
+      * ``repeats_factor``    — 1 - clip(repeats_50char × 0.05, 0, 1).
+        ≥20 verbatim ~50-char repeats → 0. Targets the
+        loop-attractor failure mode.
+      * ``word_list_factor``  — 1 - clip(word_list_ratio × 1.5, 0, 1).
+        Word-list ratio is the fraction of "words" >50 chars long
+        OR newlines ÷ total tokens. Catches the glossary-mode
+        degeneration where the model emits dense single-word lines
+        without sentence structure.
+      * ``meaningful_factor`` — 1 - clip((mean_word_len - 10) × 0.2,
+        0, 1). Mean word length above ~10 chars indicates
+        meaningless compound coinage like "boblynberry-vogesters".
+      * ``punctuation_factor`` — derail mode where the model emits
+        a long run of single related words ("low puff breathe exhale
+        inhale swallow…") drops nearly all punctuation. Coherent
+        prose has 8-15 percent punctuation chars; word-list mode
+        has ≤1 percent. Penalises responses with <5 percent
+        punctuation in samples ≥200 chars.
+      * ``unique_word_factor`` — sentence-structure proxy. Coherent
+        prose recycles common function words ("the", "and", "of",
+        "to") so its unique-word fraction is ~0.45-0.65 on
+        passages of 50+ words. Word-list derail mode has
+        unique-word fraction ≥0.85 (every emitted word is a new
+        content word with no glue). Penalty kicks in at ≥0.80.
+
+    Soft floor at 0.05 so a true-but-imperfect response isn't
+    ground to zero by a single noisy signal.
+    """
+    if not text:
+        return 1.0
+    text_len = len(text)
+    if text_len < 50:
+        return 1.0
+    # 2026-05-01 (v30.4 patch v3): non-ASCII detection is now MUCH
+    # stricter. The chat.arbos.life screenshot showed ~10 percent
+    # non-ASCII chars (CJK + Cyrillic + Hebrew + Arabic words mixed
+    # into English prose) and still scored 0.6 with the old
+    # multiplier. That's a clear derail; should score <0.1. Multiplier
+    # raised 4× → 12×: at 8 percent non-ASCII the factor is now 0,
+    # at 4 percent it's 0.5. Coherent English-prompted responses
+    # should be 0 percent non-ASCII; even latex math symbols rarely
+    # exceed 1 percent.
+    non_ascii = sum(1 for c in text if ord(c) > 127)
+    non_ascii_frac = non_ascii / text_len
+    non_ascii_factor = max(0.0, 1.0 - min(1.0, non_ascii_frac * 12.0))
+    # CJK / Cyrillic / Arabic / Hebrew script-bleed: SPECIFIC counter
+    # for non-Latin script chars (excludes things like emoji + accents
+    # which are common in coherent multilingual prose). Catches the
+    # multi-language derail mode (chat screenshot showed Chinese,
+    # Korean, Cyrillic, Hebrew letters mixed in random places).
+    non_latin_script = sum(
+        1 for c in text
+        if (
+            0x0400 <= ord(c) <= 0x04FF or  # Cyrillic
+            0x0590 <= ord(c) <= 0x05FF or  # Hebrew
+            0x0600 <= ord(c) <= 0x06FF or  # Arabic
+            0x0900 <= ord(c) <= 0x097F or  # Devanagari
+            0x3040 <= ord(c) <= 0x309F or  # Hiragana
+            0x30A0 <= ord(c) <= 0x30FF or  # Katakana
+            0x3400 <= ord(c) <= 0x4DBF or  # CJK Ext A
+            0x4E00 <= ord(c) <= 0x9FFF or  # CJK Unified
+            0xAC00 <= ord(c) <= 0xD7AF     # Hangul
+        )
+    )
+    non_latin_frac = non_latin_script / text_len
+    # ANY non-Latin script in an English-prompted response is a
+    # strong derail signal. Even 1 percent (a single sentence's
+    # worth in a 5000-char response) flips this factor to 0.
+    if non_latin_frac >= 0.01:
+        non_latin_factor = 0.0
+    else:
+        non_latin_factor = max(0.0, 1.0 - non_latin_frac * 100.0)
+    seen = set()
+    repeats = 0
+    win = 50
+    step = 25
+    for i in range(0, text_len - win, step):
+        s = text[i:i + win]
+        if s in seen:
+            repeats += 1
+        seen.add(s)
+    repeats_factor = max(0.0, 1.0 - min(1.0, repeats * 0.05))
+    words = text.split()
+    n_words = len(words)
+    if n_words == 0:
+        return 0.0
+    long_words = sum(1 for w in words if len(w) > 50)
+    long_word_ratio = long_words / n_words
+    word_list_factor = max(0.0, 1.0 - min(1.0, long_word_ratio * 1.5))
+    word_lens = [len(w) for w in words[:1000]]
+    if word_lens:
+        mean_word_len = sum(word_lens) / len(word_lens)
+    else:
+        mean_word_len = 5.0
+    # 2026-05-01 (v30.4 patch v2): raised threshold 10 → 20 chars.
+    # Academic / technical prose has 10-15 char words frequently
+    # (e.g. "Philosophical Inquiry into Artificial Intelligence")
+    # without being derailed; the signal targets the >50-char
+    # nonsense-compound mode like "jovialincarnacioappreciable".
+    meaningful_factor = max(0.0, 1.0 - max(0.0, (mean_word_len - 20.0) * 0.1))
+    # Punctuation density. 2026-05-01 (v30.4 patch v2): lowered
+    # floor 0.03 → 0.015 and raised the gate ≥400 → ≥600. Markdown-
+    # formatted long-form prose (with headers, lists, and code
+    # snippets) runs at 1.5-2.5 percent. True word-list derail
+    # runs at 0-0.5 percent across long stretches.
+    punct_chars = sum(
+        1 for c in text if c in ".,;:?!\"'()[]{}—–-"
+    )
+    punct_frac = punct_chars / max(1, text_len)
+    if text_len < 600:
+        punctuation_factor = 1.0
+    elif punct_frac >= 0.015:
+        punctuation_factor = 1.0
+    else:
+        punctuation_factor = max(0.0, min(1.0, punct_frac / 0.015))
+    # Unique-word fraction. Lowercase + alpha-only. Only triggers on
+    # LONG samples (≥150 words) where natural prose has had a chance
+    # to recycle function words. Short coherent essays naturally
+    # have high unique-word fraction (they're packed with content).
+    norm_words = [w.strip(".,;:?!\"'()[]{}").lower() for w in words]
+    norm_words = [w for w in norm_words if w and w.replace("-", "").isalpha()]
+    if len(norm_words) >= 150:
+        unique_frac = len(set(norm_words)) / len(norm_words)
+        if unique_frac < 0.85:
+            unique_word_factor = 1.0
+        else:
+            # 0.85 → 1.0; 0.95 → 0.0. Word-list mode reaches >0.95.
+            unique_word_factor = max(
+                0.0, 1.0 - (unique_frac - 0.85) / 0.10
+            )
+    else:
+        unique_word_factor = 1.0
+    # 2026-05-01 (v30.4 patch v3): English stop-word ratio. Real
+    # English prose is 30-40 percent function words ("the", "and",
+    # "of", "to", "a", "in", "is", "that"). Word-list derail mode
+    # ("low puff breathe exhale inhale swallow chew bite lick taste
+    # smell hear see look watch...") has near-zero stop words because
+    # it's all content words. We measure the ratio on samples ≥80
+    # words. If ≥12 percent stop-words, full credit; if ≤2 percent,
+    # zero credit; linear in between. This is the killer signal for
+    # the word-list derail mode where every other detector signal
+    # leaves an opening.
+    if len(norm_words) >= 80:
+        _STOP_WORDS = {
+            "the", "and", "of", "to", "a", "in", "is", "that", "it",
+            "for", "on", "with", "as", "by", "this", "are", "or",
+            "be", "an", "at", "from", "but", "not", "have", "has",
+            "had", "was", "were", "we", "you", "they", "their", "its",
+            "his", "her", "she", "he", "i", "me", "my", "our", "us",
+            "would", "could", "should", "will", "can", "may", "if",
+            "then", "than", "so", "such", "no", "all", "more", "most",
+            "some", "any", "other", "these", "those", "there", "what",
+            "which", "who", "when", "where", "while", "about", "into",
+            "through", "between", "after", "before", "during",
+            "because", "however", "thus", "also", "yet", "though",
+            "do", "does", "did", "been", "being", "am",
+        }
+        stop_count = sum(1 for w in norm_words if w in _STOP_WORDS)
+        stop_ratio = stop_count / len(norm_words)
+        if stop_ratio >= 0.12:
+            stop_word_factor = 1.0
+        elif stop_ratio <= 0.02:
+            stop_word_factor = 0.0
+        else:
+            stop_word_factor = (stop_ratio - 0.02) / (0.12 - 0.02)
+    else:
+        stop_word_factor = 1.0
+    coherence = (
+        non_ascii_factor
+        * non_latin_factor
+        * repeats_factor
+        * word_list_factor
+        * meaningful_factor
+        * punctuation_factor
+        * unique_word_factor
+        * stop_word_factor
+    )
+    return max(0.05, min(1.0, coherence))
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -2109,8 +3091,8 @@ CHAT_TURNS_PROBE_POOL = (
         "Boil your phrasing down to a single one-sentence message I can use as the opening line.",
     ),
 )
-CHAT_TURNS_PROBE_PER_ROUND = int(os.environ.get("CHAT_TURNS_PROBE_PER_ROUND", "6"))
-CHAT_TURNS_PROBE_MAX_TOKENS = int(os.environ.get("CHAT_TURNS_PROBE_MAX_TOKENS", "200"))
+CHAT_TURNS_PROBE_PER_ROUND = int(os.environ.get("CHAT_TURNS_PROBE_PER_ROUND", "14"))
+CHAT_TURNS_PROBE_MAX_TOKENS = int(os.environ.get("CHAT_TURNS_PROBE_MAX_TOKENS", "260"))
 # v29.6 (2026-04-29): N-turn chain length for procedural synthesis.
 # Default 3 matches the historical legacy pool.
 CHAT_TURNS_PROBE_TURNS_PER_PROMPT = int(
@@ -2249,58 +3231,61 @@ def chat_turns_response_probe(model, tokenizer, device="cuda"):
         return out
     if not getattr(tokenizer, "chat_template", None):
         return out
-    eos_ids = []
-    for tok in ("<|im_end|>", "<|endoftext|>"):
-        tid = tokenizer.convert_tokens_to_ids(tok)
-        if isinstance(tid, int) and tid >= 0:
-            eos_ids.append(tid)
-    if getattr(tokenizer, "eos_token_id", None) is not None:
-        eos_ids.append(int(tokenizer.eos_token_id))
-    eos_ids = list(set(eos_ids)) or None
-    pad_id = getattr(tokenizer, "pad_token_id", None)
-    if pad_id is None:
-        pad_id = eos_ids[0] if eos_ids else 0
-    was_training = model.training
-    model.eval()
-    try:
-        with torch.no_grad():
-            for convo in CHAT_TURNS_PROBE_PROMPTS:
-                turn_responses: list[str] = []
-                turn_tokens: list[int] = []
-                msgs: list[dict] = []
-                for user_turn in convo:
-                    msgs.append({"role": "user", "content": user_turn})
-                    try:
-                        rendered = _render_chat_multi_turn(
-                            tokenizer, msgs, enable_thinking=False)
-                        ids = tokenizer(
-                            rendered, return_tensors="pt",
-                            truncation=True, max_length=3072,
-                        ).input_ids.to(device)
-                        gen = model.generate(
-                            ids, max_new_tokens=CHAT_TURNS_PROBE_MAX_TOKENS,
-                            do_sample=False, temperature=1.0, top_p=1.0,
-                            pad_token_id=pad_id, eos_token_id=eos_ids,
-                            use_cache=True,
-                        )
-                        new_ids = gen[0, ids.shape[1]:]
-                        text = tokenizer.decode(new_ids, skip_special_tokens=True)
-                        resp = _strip_thinking_probe(text)
-                        turn_responses.append(resp)
-                        turn_tokens.append(int(new_ids.shape[0]))
-                        msgs.append({"role": "assistant", "content": resp})
-                    except Exception as e:
-                        turn_responses.append("")
-                        turn_tokens.append(0)
-                        msgs.append({"role": "assistant", "content": ""})
-                        print(f"[chat-turns-probe] student gen error: "
-                              f"{str(e)[:120]}", flush=True)
-                out["responses"].append(turn_responses)
-                out["gen_tokens"].append(turn_tokens)
-    finally:
-        if was_training:
-            model.train()
+    eos_ids, pad_id = _eos_pad_ids(tokenizer)
+    with _model_eval_no_grad(model):
+        for convo in CHAT_TURNS_PROBE_PROMPTS:
+            turn_responses: list[str] = []
+            turn_tokens: list[int] = []
+            msgs: list[dict] = []
+            for user_turn in convo:
+                msgs.append({"role": "user", "content": user_turn})
+                try:
+                    rendered = _render_chat_multi_turn(
+                        tokenizer, msgs, enable_thinking=BENCH_ENABLE_THINKING)
+                    ids = tokenizer(
+                        rendered, return_tensors="pt",
+                        truncation=True, max_length=3072,
+                    ).input_ids.to(device)
+                    gen = model.generate(
+                        ids, max_new_tokens=CHAT_TURNS_PROBE_MAX_TOKENS,
+                        do_sample=False, temperature=1.0, top_p=1.0,
+                        pad_token_id=pad_id, eos_token_id=eos_ids,
+                        use_cache=True,
+                    )
+                    new_ids = gen[0, ids.shape[1]:]
+                    text = tokenizer.decode(new_ids, skip_special_tokens=True)
+                    resp = _strip_thinking_probe(text)
+                    turn_responses.append(resp)
+                    turn_tokens.append(int(new_ids.shape[0]))
+                    msgs.append({"role": "assistant", "content": resp})
+                except Exception as e:
+                    turn_responses.append("")
+                    turn_tokens.append(0)
+                    msgs.append({"role": "assistant", "content": ""})
+                    print(f"[chat-turns-probe] student gen error: "
+                          f"{str(e)[:120]}", flush=True)
+            out["responses"].append(turn_responses)
+            out["gen_tokens"].append(turn_tokens)
     return out
+
+
+def _build_chat_turns_rubric(item: tuple) -> str:
+    convo, convo_responses = item
+    transcript = _format_transcript(convo, convo_responses)
+    return CHAT_TURNS_RUBRIC_TEMPLATE.format(transcript=transcript[:4096])
+
+
+def _chat_turns_record_extras(item: tuple) -> dict:
+    convo, _ = item
+    return {"seed": (convo[0] or "")[:120] if convo else ""}
+
+
+def _chat_turns_agg_init(collected: dict) -> dict:
+    return {
+        "n": 0, "n_valid": 0, "mean_score": None,
+        "normalized": None, "per_convo": [],
+        "n_turns": (collected or {}).get("n_turns", 3),
+    }
 
 
 def chat_turns_teacher_score(teacher, tokenizer, collected: dict,
@@ -2310,79 +3295,45 @@ def chat_turns_teacher_score(teacher, tokenizer, collected: dict,
     normalized to [0, 1]. Distribution + per-conversation scores stored
     for dashboard transparency.
     """
-    agg = {
-        "n": 0, "n_valid": 0, "mean_score": None,
-        "normalized": None, "per_convo": [],
-        "n_turns": (collected or {}).get("n_turns", 3),
-    }
-    if teacher is None or tokenizer is None or not collected:
+    agg = _chat_turns_agg_init(collected)
+    if teacher is None or tokenizer is None:
         return agg
-    prompts = collected.get("prompts") or []
-    responses = collected.get("responses") or []
-    if not prompts or not responses:
+    items = _judge_rubric_inputs(collected)
+    if items is None:
         return agg
-    eos_ids = []
-    for tok in ("<|im_end|>", "<|endoftext|>"):
-        tid = tokenizer.convert_tokens_to_ids(tok)
-        if isinstance(tid, int) and tid >= 0:
-            eos_ids.append(tid)
-    if getattr(tokenizer, "eos_token_id", None) is not None:
-        eos_ids.append(int(tokenizer.eos_token_id))
-    eos_ids = list(set(eos_ids)) or None
-    pad_id = getattr(tokenizer, "pad_token_id", None)
-    if pad_id is None:
-        pad_id = eos_ids[0] if eos_ids else 0
-    was_training = teacher.training
-    teacher.eval()
-    scores: list[int | None] = []
-    try:
-        with torch.no_grad():
-            for convo, convo_responses in zip(prompts, responses):
-                agg["n"] += 1
-                try:
-                    transcript = _format_transcript(convo, convo_responses)
-                    rubric = CHAT_TURNS_RUBRIC_TEMPLATE.format(
-                        transcript=transcript[:4096])
-                    rendered = _render_chat_prompt(
-                        tokenizer, rubric, enable_thinking=False)
-                    ids = tokenizer(
-                        rendered, return_tensors="pt",
-                        truncation=True, max_length=6144,
-                    ).input_ids.to(device)
-                    gen = teacher.generate(
-                        ids, max_new_tokens=8,
-                        do_sample=False, temperature=1.0, top_p=1.0,
-                        pad_token_id=pad_id, eos_token_id=eos_ids,
-                        use_cache=True,
-                    )
-                    new_ids = gen[0, ids.shape[1]:]
-                    text = tokenizer.decode(new_ids, skip_special_tokens=True)
-                    score = _parse_judge_score(text)
-                    scores.append(score)
-                    seed_preview = (convo[0] or "")[:120]
-                    agg["per_convo"].append({
-                        "seed": seed_preview,
-                        "raw": text[:24],
-                        "score": score,
-                    })
-                    if score is not None:
-                        agg["n_valid"] += 1
-                except Exception as e:
-                    scores.append(None)
-                    agg["per_convo"].append({
-                        "seed": (convo[0] or "")[:120] if convo else "",
-                        "error": str(e)[:120],
-                        "score": None,
-                    })
-    finally:
-        if was_training:
-            teacher.train()
-    valid = [s for s in scores if s is not None]
-    if valid:
-        mean = sum(valid) / len(valid)
-        agg["mean_score"] = round(mean, 3)
-        agg["normalized"] = round(max(0.0, min(1.0, (mean - 1.0) / 4.0)), 4)
-    return agg
+    scores, records = _teacher_rubric_local(
+        teacher=teacher, tokenizer=tokenizer, device=device,
+        items=items,
+        build_rubric=_build_chat_turns_rubric,
+        record_extras=_chat_turns_record_extras,
+        max_input_len=6144,
+    )
+    return _finalize_judge_agg(agg, scores, records, "per_convo")
+
+
+def chat_turns_teacher_score_api(api_cfg, tokenizer, collected: dict,
+                                  concurrency: int = 4) -> dict:
+    """API-routed equivalent of :func:`chat_turns_teacher_score`.
+
+    Same routing rationale as the two judge_*_api siblings above.
+    Concurrency is parallelised per (convo, responses) tuple — there
+    are typically only 4 of these per student so the budget stays
+    well under any rate limit.
+    """
+    agg = _chat_turns_agg_init(collected)
+    if api_cfg is None or tokenizer is None:
+        return agg
+    items = _judge_rubric_inputs(collected)
+    if items is None:
+        return agg
+    scores, records = _teacher_rubric_api(
+        api_cfg=api_cfg, tokenizer=tokenizer,
+        items=items,
+        build_rubric=_build_chat_turns_rubric,
+        record_extras=_chat_turns_record_extras,
+        concurrency=concurrency,
+    )
+    return _finalize_judge_agg(agg, scores, records, "per_convo")
 
 
 _CAPABILITY_STATIC_POOL = [
@@ -2603,7 +3554,17 @@ CAPABILITY_PROBE_MAX_TOKENS = int(os.environ.get("CAPABILITY_PROBE_MAX_TOKENS", 
 # Override via env if a regression in procedural calibration forces
 # rollback to the v29.4 mix.
 CAPABILITY_PROBE_N = int(os.environ.get("CAPABILITY_PROBE_N", "0"))
-CAPABILITY_PROBE_N_PROC_MATH = int(os.environ.get("CAPABILITY_PROBE_N_PROC_MATH", "36"))
+# 2026-05-04 (v30.5 throughput) — capability probe trim. 36 items was
+# leftover from the v29.5 mix expansion when we still ran the capability
+# axis as the main accuracy signal; bench_battery now provides the
+# heavyweight accuracy measurement (HumanEval, MBPP, AIME, MATH-500,
+# IFEval, GPQA), so capability degenerates into a quick "doesn't
+# trivially derail on multi-step reasoning" sanity check. 24 procedural
+# items keep the SE on the 0–1 pass rate at ~0.10 (binomial), which is
+# tighter than the 0.15 dethrone margin — losing 12 items just trims the
+# probe wall clock by ~33% with no change in scoring decisions. Operators
+# can revert via env if a regression in calibration is observed.
+CAPABILITY_PROBE_N_PROC_MATH = int(os.environ.get("CAPABILITY_PROBE_N_PROC_MATH", "24"))
 LENGTH_PENALTY_RATIO = float(os.environ.get("LENGTH_PENALTY_RATIO", "2.0"))
 
 # ── 2026-04-29 (v29.5) — Procedural lexicon synthesisers ──────────────
@@ -2702,6 +3663,92 @@ def _synthetic_names(rng: "random.Random", n: int) -> list[str]:
         seen.add(name)
         out.append(name)
     return out
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 2026-05-01 (v30.4 patch v4): real-name / real-concrete-object pools
+# for axes where READABILITY of the prompt matters (theory-of-mind,
+# epistemic state tracking). Anti-memorisation is preserved because
+# the SCENARIO (combination of name1 + name2 + object + container1 +
+# container2 + which question type) is freshly drawn from block_seed
+# every round; even with 200 names × 60 objects × 30 containers ×
+# 30 containers × 2 question types = ~22B unique scenarios, which is
+# unmemorisable. The legacy ``_synthetic_*`` helpers stay in use for
+# axes where the answer depends on character-level features
+# (count_chars, count_vowels — those would leak prior knowledge if
+# fed real dictionary words).
+
+_REAL_FIRST_NAMES = (
+    "Alex", "Sam", "Jordan", "Taylor", "Casey", "Morgan", "Riley",
+    "Avery", "Quinn", "Reese", "Sage", "Drew", "Logan", "Parker",
+    "Harper", "Hunter", "Finley", "Skyler", "Rowan", "Eden",
+    "Kai", "Nico", "Aria", "Mira", "Ezra", "Iris", "Kira", "Luca",
+    "Maya", "Owen", "Naomi", "Theo", "Zoe", "Ari", "Beau", "Cleo",
+    "Daria", "Eli", "Felix", "Gemma", "Hugo", "Ivy", "Jules",
+    "Kit", "Leo", "Mira", "Noah", "Octavia", "Phoebe", "Reyna",
+    "Soren", "Tess", "Uma", "Vera", "Wren", "Xander", "Yael",
+    "Zara", "Asher", "Briar", "Clio", "Dax", "Elena", "Fox",
+    "Genevieve", "Holland", "Indigo", "Jasper", "Kira", "Lior",
+    "Marlo", "Nadia", "Orion", "Priya", "Quill", "Rafe", "Saoirse",
+    "Tobias", "Una", "Vesper", "Wendell", "Xiomara", "Yuki",
+    "Zev", "Adira", "Bryn", "Calix", "Dahlia", "Edwin", "Fiona",
+    "Galen", "Hadley", "Ines", "Jovan", "Kendra", "Lyle",
+    "Marisol", "Niko", "Ophelia", "Pierce", "Quincy", "Rosalind",
+    "Silas", "Talia", "Ulrich", "Vivienne", "Wesley", "Ximena",
+    "Yusuf", "Zelda", "Anders", "Beatrix", "Caspian", "Delphine",
+    "Emil", "Florence", "Grayson", "Hester", "Idris", "June",
+    "Klaus", "Lola", "Magnus", "Niamh", "Otis", "Petra", "Quentin",
+    "Ronan", "Sigrid", "Tarquin", "Ursula", "Viggo", "Winona",
+    "Yvette", "Zach", "Astrid", "Bram", "Calliope",
+)
+
+_REAL_OBJECTS = (
+    "key", "book", "pen", "watch", "ring", "coin", "ticket",
+    "letter", "passport", "phone", "wallet", "scarf", "umbrella",
+    "notebook", "diary", "lighter", "necklace", "bracelet",
+    "remote", "calculator", "stamp", "envelope", "bookmark",
+    "compass", "magnifying glass", "candle", "thimble", "marble",
+    "stopwatch", "memory card", "USB stick", "earring", "badge",
+    "medallion", "sketchbook", "fountain pen", "monocle",
+    "pocket knife", "deck of cards", "harmonica", "snow globe",
+    "music box", "locket", "brooch", "compass rose", "magnet",
+    "keycard", "library card", "fishing lure", "pocket watch",
+    "nameplate", "pin", "polaroid", "tape measure", "spool",
+    "thumb drive", "stylus", "hairpin", "matchbox", "domino",
+)
+
+_REAL_CONTAINERS = (
+    "drawer", "cabinet", "closet", "trunk", "chest",
+    "backpack", "briefcase", "purse", "tote bag",
+    "lunchbox", "shoebox", "jewelry box", "tin", "basket",
+    "filing cabinet", "wardrobe", "ottoman", "bookshelf",
+    "bedside table", "kitchen drawer", "desk drawer", "safe",
+    "locker", "glove compartment", "garage cabinet", "pantry",
+    "linen closet", "sock drawer", "spice rack", "tool chest",
+    "treasure chest", "pencil case", "tackle box", "hatbox",
+    "music box", "cookie jar", "vase", "flower pot", "saddlebag",
+)
+
+
+def _realistic_name(rng: "random.Random") -> str:
+    """Return a real-looking English first name. Used in axes where
+    readability is more valuable than character-level anti-leak."""
+    return rng.choice(_REAL_FIRST_NAMES)
+
+
+def _realistic_names(rng: "random.Random", n: int) -> list[str]:
+    """Return ``n`` distinct real-looking first names."""
+    pool = list(_REAL_FIRST_NAMES)
+    rng.shuffle(pool)
+    return pool[:n] if n <= len(pool) else (pool + pool[:n - len(pool)])
+
+
+def _realistic_object(rng: "random.Random") -> str:
+    return rng.choice(_REAL_OBJECTS)
+
+
+def _realistic_container(rng: "random.Random") -> str:
+    return rng.choice(_REAL_CONTAINERS)
 
 
 def _synthetic_org_topic(rng: "random.Random") -> str:
@@ -3333,37 +4380,6 @@ def _procedural_capability_prompts(rng, n):
     return out
 
 
-def _procedural_math_prompts(rng, n):
-    """Backwards-compatible shim: arithmetic-only procedural prompts.
-
-    Existed before round 19 expansion. Internal callers should prefer
-    ``_procedural_capability_prompts``; this name is retained because
-    operators may have set the legacy ``CAPABILITY_PROBE_N_PROC_MATH``
-    env var expecting arithmetic-only behaviour.
-    """
-    out = []
-    for _ in range(n):
-        kind = rng.choice(["add", "sub", "mul", "div", "mod"])
-        if kind == "add":
-            a, b = rng.randint(17, 499), rng.randint(17, 499)
-            out.append({"q": f"What is {a} + {b}? Answer with only the number.", "a": str(a + b), "kind": "int"})
-        elif kind == "sub":
-            a, b = rng.randint(100, 900), rng.randint(10, 99)
-            out.append({"q": f"What is {a} - {b}? Answer with only the number.", "a": str(a - b), "kind": "int"})
-        elif kind == "mul":
-            a, b = rng.randint(2, 15), rng.randint(2, 15)
-            out.append({"q": f"What is {a} * {b}? Answer with only the number.", "a": str(a * b), "kind": "int"})
-        elif kind == "div":
-            b = rng.randint(2, 12)
-            q = rng.randint(2, 25)
-            a = b * q
-            out.append({"q": f"What is {a} / {b}? Answer with only the number.", "a": str(q), "kind": "int"})
-        else:
-            a, b = rng.randint(20, 200), rng.randint(3, 9)
-            out.append({"q": f"What is {a} mod {b}? Answer with only the number.", "a": str(a % b), "kind": "int"})
-    return out
-
-
 def build_capability_prompts(block_seed=None):
     """Return the per-round capability prompt list.
 
@@ -3427,7 +4443,7 @@ def chat_response_probe(model, tokenizer, device="cuda"):
     "Thinking Process:..." loop that never emits a user-facing answer.
 
     For a short list of trivial prompts, run the student's chat template with
-    enable_thinking=False and require:
+    enable_thinking=BENCH_ENABLE_THINKING and require:
       - at least CHAT_PROBE_TERMINATE_THRESHOLD of prompts emit EOS inside
         CHAT_PROBE_MAX_TOKENS
       - at least CHAT_PROBE_TERMINATE_THRESHOLD produce non-empty content after
@@ -3449,35 +4465,22 @@ def chat_response_probe(model, tokenizer, device="cuda"):
         if not tpl_ok:
             stats["reason"] = "probe_skip:no_chat_template"
             return stats
-        eos_ids = []
-        for tok in ["<|im_end|>", "<|endoftext|>"]:
-            tid = tokenizer.convert_tokens_to_ids(tok)
-            if isinstance(tid, int) and tid >= 0:
-                eos_ids.append(tid)
-        if getattr(tokenizer, "eos_token_id", None) is not None:
-            eos_ids.append(int(tokenizer.eos_token_id))
-        eos_ids = list(set(eos_ids)) or None
+        eos_ids, pad_id = _eos_pad_ids(tokenizer)
 
-        pad_id = getattr(tokenizer, "pad_token_id", None)
-        if pad_id is None:
-            pad_id = eos_ids[0] if eos_ids else 0
-
-        was_training = model.training
-        model.eval()
         terminated = 0
         non_empty = 0
         gen_tokens_acc = 0
         content_chars_acc = 0
         reasoning_frac_acc = 0.0
 
-        with torch.no_grad():
+        with _model_eval_no_grad(model):
             for prompt in CHAT_PROBE_PROMPTS:
                 msgs = [{"role": "user", "content": prompt}]
                 try:
                     try:
                         rendered = tokenizer.apply_chat_template(
                             msgs, tokenize=False, add_generation_prompt=True,
-                            enable_thinking=False,
+                            enable_thinking=BENCH_ENABLE_THINKING,
                         )
                     except TypeError:
                         rendered = tokenizer.apply_chat_template(
@@ -3538,8 +4541,6 @@ def chat_response_probe(model, tokenizer, device="cuda"):
                 f"mean_think_frac={stats['mean_reasoning_fraction']:.2f}"
             )
 
-        if was_training:
-            model.train()
         return stats
     except Exception as e:
         stats["reason"] = f"probe_error:{str(e)[:120]}"
@@ -3760,31 +4761,14 @@ def capability_probe(model, tokenizer, device="cuda"):
         if not getattr(tokenizer, "chat_template", None):
             return out
 
-        eos_ids = []
-        for tok in ["<|im_end|>", "<|endoftext|>"]:
-            tid = tokenizer.convert_tokens_to_ids(tok)
-            if isinstance(tid, int) and tid >= 0:
-                eos_ids.append(tid)
-        if getattr(tokenizer, "eos_token_id", None) is not None:
-            eos_ids.append(int(tokenizer.eos_token_id))
-        eos_ids = list(set(eos_ids)) or None
-        pad_id = getattr(tokenizer, "pad_token_id", None) or (eos_ids[0] if eos_ids else 0)
+        eos_ids, pad_id = _eos_pad_ids(tokenizer)
 
-        was_training = model.training
-        model.eval()
-        with torch.no_grad():
+        with _model_eval_no_grad(model):
             for item in CAPABILITY_PROBE_PROMPTS:
-                msgs = [{"role": "user", "content": item["q"]}]
                 try:
-                    try:
-                        rendered = tokenizer.apply_chat_template(
-                            msgs, tokenize=False, add_generation_prompt=True,
-                            enable_thinking=False,
-                        )
-                    except TypeError:
-                        rendered = tokenizer.apply_chat_template(
-                            msgs, tokenize=False, add_generation_prompt=True,
-                        )
+                    rendered = _render_chat_prompt(
+                        tokenizer, item["q"], enable_thinking=BENCH_ENABLE_THINKING,
+                    )
                     ids = tokenizer(rendered, return_tensors="pt").input_ids.to(device)
                     gen = model.generate(
                         ids, max_new_tokens=CAPABILITY_PROBE_MAX_TOKENS,
@@ -3805,8 +4789,6 @@ def capability_probe(model, tokenizer, device="cuda"):
                     out["correct"] += ok
                 except Exception as e:
                     out["items"].append({"q": item["q"], "error": str(e)[:120]})
-        if was_training:
-            model.train()
         out["pass_frac"] = out["correct"] / max(1, out["n"])
     except Exception as e:
         out["error"] = str(e)[:200]
@@ -3851,9 +4833,9 @@ def _render_chat_prompt(tokenizer, user_text: str, enable_thinking: bool = False
 #                        vote → compare to gold. Tests robustness of
 #                        underlying knowledge vs one-shot luck.
 #
-# Each probe samples K items per round via ``_pick_bench_items`` seeded by
-# the on-chain ``block_seed``, so every validator computes the same
-# items but they rotate round-to-round (anti-memorization).
+# Each probe receives K procedural items per round generated by
+# ``_generate_*_items(block_seed, K)``, so every validator computes the
+# same items but they rotate round-to-round (anti-memorization).
 #
 # See ``reports/2026-04-24-arena-v3.md`` for the Affine-Cortex-inspired
 # design doc and rationale.
@@ -3895,8 +4877,8 @@ BENCH_BATTERY_SHADOW_AXES = (
 #                                  math_bench at no extra wall-time).
 #   * ifeval_bench:    10 →  8 (instruction-following, weight 0.05 → 0.07).
 BENCH_MATH_PER_ROUND = int(os.environ.get("BENCH_MATH_PER_ROUND", "12"))
-BENCH_CODE_PER_ROUND = int(os.environ.get("BENCH_CODE_PER_ROUND", "8"))
-BENCH_REASONING_PER_ROUND = int(os.environ.get("BENCH_REASONING_PER_ROUND", "10"))
+BENCH_CODE_PER_ROUND = int(os.environ.get("BENCH_CODE_PER_ROUND", "18"))
+BENCH_REASONING_PER_ROUND = int(os.environ.get("BENCH_REASONING_PER_ROUND", "18"))
 BENCH_KNOWLEDGE_PER_ROUND = int(os.environ.get("BENCH_KNOWLEDGE_PER_ROUND", "0"))
 BENCH_IFEVAL_PER_ROUND = int(os.environ.get("BENCH_IFEVAL_PER_ROUND", "8"))
 
@@ -3909,7 +4891,7 @@ BENCH_IFEVAL_PER_ROUND = int(os.environ.get("BENCH_IFEVAL_PER_ROUND", "8"))
 #                                       no marginal signal).
 BENCH_AIME_PER_ROUND = int(os.environ.get("BENCH_AIME_PER_ROUND", "8"))
 BENCH_MBPP_PER_ROUND = int(os.environ.get("BENCH_MBPP_PER_ROUND", "8"))
-BENCH_TOOL_USE_PER_ROUND = int(os.environ.get("BENCH_TOOL_USE_PER_ROUND", "6"))
+BENCH_TOOL_USE_PER_ROUND = int(os.environ.get("BENCH_TOOL_USE_PER_ROUND", "16"))
 BENCH_SELF_CONSISTENCY_PER_ROUND = int(os.environ.get("BENCH_SELF_CONSISTENCY_PER_ROUND", "0"))
 BENCH_SELF_CONSISTENCY_SAMPLES = int(os.environ.get("BENCH_SELF_CONSISTENCY_SAMPLES", "5"))
 BENCH_SELF_CONSISTENCY_TEMP = float(os.environ.get("BENCH_SELF_CONSISTENCY_TEMP", "0.7"))
@@ -4006,7 +4988,7 @@ BENCH_MULTI_DOC_MAX_TOKENS = int(os.environ.get("BENCH_MULTI_DOC_MAX_TOKENS", "6
 # v29.4 — calibration_bench. Mix solvable + intentionally unsolvable
 # items; reward correct answers AND correct refusals. Discourages
 # confabulation.
-BENCH_CALIBRATION_PER_ROUND = int(os.environ.get("BENCH_CALIBRATION_PER_ROUND", "8"))
+BENCH_CALIBRATION_PER_ROUND = int(os.environ.get("BENCH_CALIBRATION_PER_ROUND", "12"))
 BENCH_CALIBRATION_UNSOLVABLE_FRACTION = float(
     os.environ.get("BENCH_CALIBRATION_UNSOLVABLE_FRACTION", "0.5"),
 )
@@ -4019,6 +5001,50 @@ BENCH_REFACTOR_MAX_TOKENS = int(os.environ.get("BENCH_REFACTOR_MAX_TOKENS", "512
 # request). Procedural items, open-ended generation with regex match.
 BENCH_PRAGMATIC_PER_ROUND = int(os.environ.get("BENCH_PRAGMATIC_PER_ROUND", "8"))
 BENCH_PRAGMATIC_MAX_TOKENS = int(os.environ.get("BENCH_PRAGMATIC_MAX_TOKENS", "64"))
+
+# ── v31 procedural axes ────────────────────────────────────────────────
+# Each v31 axis defaults to PER_ROUND=0 (axis disabled) so the change is
+# fully opt-in. To enable in SHADOW mode for one validator, set the env
+# var to a positive integer (e.g. 10) and restart the service. The
+# corresponding bench axis will appear in ``axes`` with a non-None
+# pass_frac but the composite weight remains 0 until we're satisfied
+# the correlation gate (``r >= 0.5`` vs canary) is met. See
+# ``reports/2026-05-09-v31-procedural-redesign.md`` §migration-plan.
+# v31 (2026-05-09 promotion): all 11 v31 axes default to PER_ROUND > 0
+# so they're active in production. Operators can flip any axis back to
+# 0 to disable telemetry without affecting the others.
+#
+# 2026-05-10 variance hardening: per-axis n was lifted by ~50% across the
+# board so the SE per axis at p=0.5 falls from ~0.14-0.18 to ~0.10-0.13.
+# This makes single-shot dethrones from a copy-with-RNG-luck attack
+# materially harder: composite SE drops below the 3% margin even before
+# the paired-SE gate kicks in. Eval wall time grows by ~5-7 min/student
+# (covered by the bumped POD_PER_MODEL_TIMEOUT). User asked for "longer
+# eval, more confidence", and the variance audit (see
+# reports/2026-05-10-variance-reduction.md) confirmed n=8 axes were the
+# top variance contributors.
+BENCH_V31_GSM_SYMBOLIC_PER_ROUND = int(os.environ.get("BENCH_V31_GSM_SYMBOLIC_PER_ROUND", "24"))
+BENCH_V31_GSM_SYMBOLIC_MAX_TOKENS = int(os.environ.get("BENCH_V31_GSM_SYMBOLIC_MAX_TOKENS", "384"))
+BENCH_V31_MATH_COMPETITION_PER_ROUND = int(os.environ.get("BENCH_V31_MATH_COMPETITION_PER_ROUND", "18"))
+BENCH_V31_MATH_COMPETITION_MAX_TOKENS = int(os.environ.get("BENCH_V31_MATH_COMPETITION_MAX_TOKENS", "512"))
+BENCH_V31_MATH_ROBUSTNESS_PER_ROUND = int(os.environ.get("BENCH_V31_MATH_ROBUSTNESS_PER_ROUND", "18"))
+BENCH_V31_MATH_ROBUSTNESS_MAX_TOKENS = int(os.environ.get("BENCH_V31_MATH_ROBUSTNESS_MAX_TOKENS", "384"))
+BENCH_V31_CODE_PLUS_PER_ROUND = int(os.environ.get("BENCH_V31_CODE_PLUS_PER_ROUND", "12"))
+BENCH_V31_CODE_PLUS_MAX_TOKENS = int(os.environ.get("BENCH_V31_CODE_PLUS_MAX_TOKENS", "512"))
+BENCH_V31_LOGIC_GRID_PER_ROUND = int(os.environ.get("BENCH_V31_LOGIC_GRID_PER_ROUND", "18"))
+BENCH_V31_LOGIC_GRID_MAX_TOKENS = int(os.environ.get("BENCH_V31_LOGIC_GRID_MAX_TOKENS", "256"))
+BENCH_V31_DYVAL_PER_ROUND = int(os.environ.get("BENCH_V31_DYVAL_PER_ROUND", "18"))
+BENCH_V31_DYVAL_MAX_TOKENS = int(os.environ.get("BENCH_V31_DYVAL_MAX_TOKENS", "256"))
+BENCH_V31_RULER_PER_ROUND = int(os.environ.get("BENCH_V31_RULER_PER_ROUND", "16"))
+BENCH_V31_RULER_MAX_TOKENS = int(os.environ.get("BENCH_V31_RULER_MAX_TOKENS", "96"))
+BENCH_V31_KG_PER_ROUND = int(os.environ.get("BENCH_V31_KG_PER_ROUND", "18"))
+BENCH_V31_KG_MAX_TOKENS = int(os.environ.get("BENCH_V31_KG_MAX_TOKENS", "128"))
+BENCH_V31_IFEVAL_PER_ROUND = int(os.environ.get("BENCH_V31_IFEVAL_PER_ROUND", "16"))
+BENCH_V31_IFEVAL_MAX_TOKENS = int(os.environ.get("BENCH_V31_IFEVAL_MAX_TOKENS", "512"))
+BENCH_V31_TRUTHFULNESS_PER_ROUND = int(os.environ.get("BENCH_V31_TRUTHFULNESS_PER_ROUND", "18"))
+BENCH_V31_TRUTHFULNESS_MAX_TOKENS = int(os.environ.get("BENCH_V31_TRUTHFULNESS_MAX_TOKENS", "192"))
+BENCH_V31_CONSISTENCY_PER_ROUND = int(os.environ.get("BENCH_V31_CONSISTENCY_PER_ROUND", "14"))
+BENCH_V31_CONSISTENCY_MAX_TOKENS = int(os.environ.get("BENCH_V31_CONSISTENCY_MAX_TOKENS", "384"))
 
 # Token budgets.
 BENCH_MATH_MAX_TOKENS = int(os.environ.get("BENCH_MATH_MAX_TOKENS", "384"))
@@ -4073,14 +5099,12 @@ _BENCH_STREAM = {
 }
 
 _BENCH_BLOCK_SEED = None
-_BENCH_POOLS: dict[str, list[dict]] = {
-    "math": [], "code": [], "reasoning": [], "knowledge": [], "ifeval": [],
-    "aime": [], "mbpp": [], "tool_use": [], "self_consistency": [],
-    "arc": [], "truthful": [], "long_context": [], "procedural": [],
-    "robustness": [], "noise": [], "debug": [],
-    "correction": [], "multi_doc": [], "calibration": [], "refactor": [],
-    "pragmatic": [],
-}
+# v27 (2026-04-26): every bench axis is procedural — items come from
+# ``_generate_*_items(block_seed, k)`` rather than a static HF pool.
+# ``_BENCH_POOLS`` and ``_bench_load_pools`` (which loaded GSM8K + MATH-500
+# + HumanEval + MBPP + BBH + MMLU-Pro + IFEval + AIME + ARC + TruthfulQA)
+# were removed in v30.5; the only consumer ever was ``_pick_bench_items``,
+# which itself was unreferenced by production code post-v27.
 _BENCH_SAMPLES: dict[str, list[dict]] = {
     "math": [], "code": [], "reasoning": [], "knowledge": [], "ifeval": [],
     "aime": [], "mbpp": [], "tool_use": [], "self_consistency": [],
@@ -4088,444 +5112,19 @@ _BENCH_SAMPLES: dict[str, list[dict]] = {
     "robustness": [], "noise": [], "debug": [],
     "correction": [], "multi_doc": [], "calibration": [], "refactor": [],
     "pragmatic": [],
+    # v31 procedural axes (PRODUCTION as of 2026-05-09 promotion).
+    "v31_gsm_symbolic": [],
+    "v31_math_competition": [],
+    "v31_math_robustness": [],
+    "v31_code_plus": [],
+    "v31_logic_grid": [],
+    "v31_dyval": [],
+    "v31_ruler": [],
+    "v31_kg": [],
+    "v31_ifeval": [],
+    "v31_truthfulness": [],
+    "v31_consistency": [],
 }
-
-
-def _bench_load_pools(verbose: bool = True):
-    """Populate ``_BENCH_POOLS`` from HF cache. Idempotent.
-
-    Runs once at the top of ``main()`` via ``set_bench_block_seed``.
-    Failures for individual datasets are logged but do not abort — a
-    missing axis just drops out of the composite, which is correct
-    behavior. All datasets are expected to be cached at
-    ``~/.cache/huggingface/datasets`` (pre-staged by ``evalscope``).
-    """
-    if all(_BENCH_POOLS[k] for k in _BENCH_POOLS):
-        return
-    try:
-        os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
-        from datasets import load_dataset  # type: ignore
-    except Exception as e:
-        if verbose:
-            print(f"[bench] datasets import failed: {e}", flush=True)
-        return
-
-    # ── math_bench: GSM8K + MATH-500 ────────────────────────────────
-    try:
-        gsm = load_dataset("openai/gsm8k", "main", split="test")
-        for item in gsm:
-            ans = str(item["answer"])
-            m = re.search(r"####\s*(-?\d[\d,]*(?:\.\d+)?)", ans)
-            if not m:
-                continue
-            gold = m.group(1).replace(",", "")
-            _BENCH_POOLS["math"].append({
-                "src": "gsm8k",
-                "question": item["question"],
-                "gold": gold,
-            })
-    except Exception as e:
-        if verbose:
-            print(f"[bench] gsm8k load error: {e}", flush=True)
-    try:
-        math500 = load_dataset("HuggingFaceH4/MATH-500", split="test")
-        for item in math500:
-            gold = str(item["answer"]).strip()
-            if not gold:
-                continue
-            _BENCH_POOLS["math"].append({
-                "src": "math500",
-                "question": item["problem"],
-                "gold": gold,
-            })
-    except Exception as e:
-        if verbose:
-            print(f"[bench] math500 load error: {e}", flush=True)
-
-    # ── code_bench: HumanEval ────────────────────────────────────────
-    try:
-        he = load_dataset("openai/openai_humaneval", split="test")
-        for item in he:
-            _BENCH_POOLS["code"].append({
-                "src": "humaneval",
-                "task_id": item["task_id"],
-                "prompt": item["prompt"],
-                "test": item["test"],
-                "entry_point": item["entry_point"],
-            })
-    except Exception as e:
-        if verbose:
-            print(f"[bench] humaneval load error: {e}", flush=True)
-
-    # ── reasoning_bench: BBH (21 objective subtasks) ────────────────
-    bbh_subtasks = [
-        "boolean_expressions", "causal_judgement", "date_understanding",
-        "disambiguation_qa", "formal_fallacies", "geometric_shapes",
-        "hyperbaton", "logical_deduction_five_objects",
-        "logical_deduction_seven_objects", "logical_deduction_three_objects",
-        "movie_recommendation", "navigate", "object_counting",
-        "penguins_in_a_table", "reasoning_about_colored_objects",
-        "ruin_names", "snarks", "sports_understanding",
-        "temporal_sequences", "tracking_shuffled_objects_five_objects",
-        "web_of_lies",
-    ]
-    for sub in bbh_subtasks:
-        try:
-            bbh = load_dataset("lukaemon/bbh", sub, split="test")
-            for item in bbh:
-                _BENCH_POOLS["reasoning"].append({
-                    "src": f"bbh/{sub}",
-                    "question": item["input"],
-                    "gold": str(item["target"]).strip(),
-                })
-        except Exception as e:
-            if verbose:
-                print(f"[bench] bbh/{sub} load error: {e}", flush=True)
-
-    # ── knowledge_bench: MMLU-Pro ───────────────────────────────────
-    try:
-        mmlu = load_dataset("TIGER-Lab/MMLU-Pro", split="test")
-        for item in mmlu:
-            opts = list(item["options"])
-            if not opts:
-                continue
-            _BENCH_POOLS["knowledge"].append({
-                "src": "mmlu-pro",
-                "question": item["question"],
-                "options": opts,
-                "gold_letter": str(item["answer"]).strip()[:1].upper(),
-                "category": item.get("category", ""),
-            })
-    except Exception as e:
-        if verbose:
-            print(f"[bench] mmlu-pro load error: {e}", flush=True)
-
-    # ── ifeval_bench: Google IFEval (train, filtered) ───────────────
-    try:
-        import ifeval_vendor as _ifev  # type: ignore
-        ife = load_dataset("google/IFEval", split="train")
-        for item in ife:
-            ids = list(item["instruction_id_list"])
-            if not _ifev.item_is_supported(ids):
-                continue
-            kwargs = list(item["kwargs"])
-            _BENCH_POOLS["ifeval"].append({
-                "src": "ifeval",
-                "prompt": item["prompt"],
-                "instruction_ids": ids,
-                "kwargs": kwargs,
-            })
-    except ImportError:
-        if verbose:
-            print("[bench] ifeval_vendor not importable — ifeval_bench skipped", flush=True)
-    except Exception as e:
-        if verbose:
-            print(f"[bench] ifeval load error: {e}", flush=True)
-
-    # ── aime_bench: AIME 2024/2025 olympiad math (Session 3) ────────
-    # We combine three small AIME datasets into one pool so we get ~90
-    # olympiad items per round to rotate through. Each answer is an
-    # integer 0..999 (AIME convention), making scoring trivially
-    # robust — boxed-answer extraction + exact-integer compare.
-    try:
-        aime25 = load_dataset("HuggingFaceH4/aime_2025", split="train")
-        for item in aime25:
-            q = item.get("problem") or item.get("question")
-            a = item.get("answer")
-            if q and a is not None:
-                _BENCH_POOLS["aime"].append({
-                    "src": "aime25",
-                    "question": str(q),
-                    "gold": str(a).strip(),
-                })
-    except Exception as e:
-        if verbose:
-            print(f"[bench] aime25 load error: {e}", flush=True)
-    try:
-        aime24 = load_dataset("Maxwell-Jia/AIME_2024", split="train")
-        for item in aime24:
-            q = item.get("Problem") or item.get("problem") or item.get("question")
-            a = item.get("Answer") or item.get("answer")
-            if q and a is not None:
-                _BENCH_POOLS["aime"].append({
-                    "src": "aime24",
-                    "question": str(q),
-                    "gold": str(a).strip(),
-                })
-    except Exception as e:
-        if verbose:
-            print(f"[bench] aime24 load error: {e}", flush=True)
-    try:
-        aimo = load_dataset("AI-MO/aimo-validation-aime", split="train")
-        for item in aimo:
-            q = item.get("problem") or item.get("question")
-            a = item.get("answer")
-            if q and a is not None:
-                _BENCH_POOLS["aime"].append({
-                    "src": "aimo-val",
-                    "question": str(q),
-                    "gold": str(a).strip(),
-                })
-    except Exception as e:
-        if verbose:
-            print(f"[bench] aimo-val load error: {e}", flush=True)
-
-    # ── mbpp_bench: MBPP+ (evalplus, Session 3) ─────────────────────
-    # 378 Python programming problems with bundled unit tests. Same
-    # subprocess-sandbox path as HumanEval but a different pool so
-    # miners can't overfit just by memorizing 164 HumanEval signatures.
-    #
-    # 2026-04-25: evalplus/mbppplus's ``test`` field is a verbose
-    # assertion *helper* (defines an ``assertion()`` function that runs
-    # many cases). The simple ``assert fn_name(...)`` pattern lives in
-    # ``test_list``. We prefer ``test_list`` for both entry-point
-    # extraction and sandbox execution; fall back to ``test`` only if
-    # ``test_list`` is missing, then extract entry_point from it.
-    try:
-        mbpp = load_dataset("evalplus/mbppplus", split="test")
-        for item in mbpp:
-            prompt = item.get("prompt") or ""
-            test_list = item.get("test_list")
-            test_verbose = item.get("test")
-            if isinstance(test_list, list) and test_list:
-                tests = "\n".join(test_list)
-            elif isinstance(test_verbose, str) and test_verbose:
-                tests = test_verbose
-            else:
-                continue
-            entry_point = item.get("entry_point") or ""
-            if not entry_point:
-                # Extract from the first assertion call. Skip common
-                # helper wrappers (``math.isclose``, ``set``, ``round``,
-                # ``abs``, ``len``, ``isinstance``) — the actual user
-                # function is typically the first arg of the wrapper.
-                _helpers = {"set", "round", "abs", "len", "isinstance",
-                            "sorted", "tuple", "list", "dict", "str", "int",
-                            "float", "frozenset", "all", "any"}
-                for cand_m in re.finditer(
-                    r"([a-zA-Z_][a-zA-Z0-9_.]*)\s*\(", tests,
-                ):
-                    cand = cand_m.group(1)
-                    base = cand.split(".")[-1] if "." in cand else cand
-                    top = cand.split(".")[0]
-                    if top in {"math", "numpy", "np", "os", "sys",
-                               "collections", "itertools", "functools"}:
-                        continue
-                    if base in _helpers:
-                        continue
-                    entry_point = base
-                    break
-            if not (prompt and tests and entry_point):
-                continue
-            _BENCH_POOLS["mbpp"].append({
-                "src": "mbpp+",
-                "task_id": str(item.get("task_id", "")),
-                "prompt": prompt,
-                "test": tests,
-                "entry_point": entry_point,
-            })
-    except Exception as e:
-        if verbose:
-            print(f"[bench] mbpp+ load error: {e}", flush=True)
-
-    # ── tool_use_bench pool (Session 3, derived) ────────────────────
-    # Reuses math items but only the ones with numerically tractable
-    # gold answers — these are the problems where writing 3 lines of
-    # Python (``<python>...</python>``) + getting the tool output back
-    # actually helps the model. Source of truth is still the math pool's
-    # gold so no additional dataset download is required.
-    if _BENCH_POOLS["math"]:
-        for it in _BENCH_POOLS["math"]:
-            g = (it.get("gold") or "").replace(",", "").replace("$", "").strip()
-            try:
-                float(g)
-            except (TypeError, ValueError):
-                # Skip items with symbolic / fractional gold — tool-use
-                # probe rewards numeric computation, not algebra.
-                continue
-            _BENCH_POOLS["tool_use"].append({
-                "src": "tool_use/" + it.get("src", "math"),
-                "question": it["question"],
-                "gold": g,
-            })
-
-    # ── self_consistency_bench pool (Session 3, derived) ────────────
-    # Hard math items only (MATH-500 and the larger-answer GSM8K items).
-    # Self-consistency is about *robustness* of underlying knowledge
-    # across samples — easy items score 1.0 for everyone regardless of
-    # sampling temperature and waste probe budget.
-    if _BENCH_POOLS["math"]:
-        for it in _BENCH_POOLS["math"]:
-            if it.get("src") == "math500":
-                _BENCH_POOLS["self_consistency"].append({
-                    "src": "sc/math500",
-                    "question": it["question"],
-                    "gold": it["gold"],
-                })
-                continue
-            g = (it.get("gold") or "").replace(",", "").replace("$", "").strip()
-            try:
-                gv = float(g)
-            except (TypeError, ValueError):
-                continue
-            if abs(gv) >= 100:
-                _BENCH_POOLS["self_consistency"].append({
-                    "src": "sc/gsm8k_hard",
-                    "question": it["question"],
-                    "gold": g,
-                })
-
-    # ── arc_bench: AI2 ARC-Challenge (Session 3.1) ──────────────────
-    # 1172 grade-school/high-school science MC questions graded for
-    # "Challenge" difficulty by AI2. Disjoint from MMLU (different
-    # curriculum + different authoring pipeline), so climbing this
-    # independently measures commonsense-science reasoning that
-    # ``knowledge_bench`` and ``reasoning_bench`` don't already cover.
-    # Letter answers A/B/C/D (sometimes 1/2/3/4 in the raw data —
-    # normalized below). Load path tolerates absence so an unknown
-    # pod HF cache layout never blocks a round.
-    try:
-        arc = None
-        for _cfg in ("ARC-Challenge", "arc_challenge"):
-            try:
-                arc = load_dataset("allenai/ai2_arc", _cfg, split="test")
-                break
-            except Exception:
-                continue
-        if arc is not None:
-            for item in arc:
-                q = item.get("question")
-                choices = item.get("choices") or {}
-                labels = list(choices.get("label") or [])
-                texts = list(choices.get("text") or [])
-                ans = str(item.get("answerKey") or "").strip()
-                if not (q and labels and texts and ans and len(labels) == len(texts)):
-                    continue
-                # ARC sometimes encodes answers as '1'/'2'/'3'/'4';
-                # normalize to letters matching the choice labels.
-                if ans in labels:
-                    gold_letter = ans
-                else:
-                    try:
-                        gold_letter = labels[int(ans) - 1]
-                    except (ValueError, IndexError):
-                        continue
-                # Upper-case for case-insensitive extraction.
-                gold_letter = gold_letter.strip().upper()[:1]
-                if gold_letter not in "ABCDEFGHIJ":
-                    continue
-                # Convert labels to uppercase A/B/C/D for a consistent prompt.
-                upper_labels = [lab.strip().upper()[:1] for lab in labels]
-                if gold_letter not in upper_labels:
-                    continue
-                _BENCH_POOLS["arc"].append({
-                    "src": "arc-challenge",
-                    "question": str(q),
-                    "labels": upper_labels,
-                    "texts": [str(t) for t in texts],
-                    "gold_letter": gold_letter,
-                })
-    except Exception as e:
-        if verbose:
-            print(f"[bench] arc-challenge load error: {e}", flush=True)
-
-    # ── truthful_bench: TruthfulQA mc1 (Session 3.4) ────────────────
-    # 817 adversarial factual questions. Each item has K candidate
-    # answers where exactly one is labelled correct (mc1_targets). We
-    # letter the candidates A/B/C/... and extract a single letter from
-    # the model's output, just like ARC/MMLU. K is variable (2-13) so
-    # we cap at 10 options to stay inside the A-J letter regex.
-    #
-    # IMPORTANT: the raw dataset always places the correct answer at
-    # index 0 (verified empirically on 2026-04-25: 817/817 items).
-    # Iterating choices in order would let a model answer "A" on every
-    # item and score 100% without reading the question. We shuffle
-    # choices deterministically using a per-question hash so:
-    #   (a) the correct letter varies across items (anti-gaming),
-    #   (b) the same question always produces the same prompt across
-    #       validators (reproducibility).
-    import hashlib as _hashlib
-    try:
-        tqa = load_dataset("truthful_qa", "multiple_choice", split="validation")
-        for item in tqa:
-            q = item.get("question")
-            mc1 = item.get("mc1_targets") or {}
-            choices = list(mc1.get("choices") or [])
-            labels = list(mc1.get("labels") or [])
-            if not (q and choices and labels) or len(choices) != len(labels):
-                continue
-            correct_idx = None
-            for i, lab in enumerate(labels):
-                if int(lab) == 1:
-                    correct_idx = i
-                    break
-            if correct_idx is None:
-                continue
-            # Cap at 10 options — keep the correct one, sample 9 wrong
-            # deterministically. For items with <=10 options we just
-            # shuffle in place.
-            if len(choices) > 10:
-                correct_text = choices[correct_idx]
-                incorrect = [c for i, c in enumerate(choices) if i != correct_idx]
-                h_wrong = _hashlib.sha256(str(q).encode()).digest()
-                seed_w = int.from_bytes(h_wrong[:8], "big")
-                import random as _rnd
-                _rnd.Random(seed_w).shuffle(incorrect)
-                choices = incorrect[:9] + [correct_text]
-                correct_idx = 9
-            # Deterministic shuffle.
-            h = _hashlib.sha256(str(q).encode()).digest()
-            seed = int.from_bytes(h[8:16], "big")
-            order = list(range(len(choices)))
-            import random as _rnd
-            _rnd.Random(seed).shuffle(order)
-            shuffled_choices = [choices[i] for i in order]
-            shuffled_correct_idx = order.index(correct_idx)
-            letters = "ABCDEFGHIJ"[: len(shuffled_choices)]
-            gold_letter = letters[shuffled_correct_idx]
-            _BENCH_POOLS["truthful"].append({
-                "src": "truthful-qa",
-                "question": str(q),
-                "labels": list(letters),
-                "texts": [str(c) for c in shuffled_choices],
-                "gold_letter": gold_letter,
-            })
-    except Exception as e:
-        if verbose:
-            print(f"[bench] truthful_qa load error: {e}", flush=True)
-
-    # 2026-04-25 (Session 3.7): robustness shares the math pool but uses
-    # an independent stream offset (_BENCH_STREAM["robustness"]) so it
-    # samples different items than math_bench in the same round. We
-    # alias rather than copy so the pool grows as math_bench grows
-    # (e.g. if we add new public-math sources later).
-    _BENCH_POOLS["robustness"] = _BENCH_POOLS["math"]
-    # 2026-04-25 (Session 3.7): noise_resistance_bench is the
-    # adversarial-noise sibling of robustness_bench. Same alias model;
-    # different stream offset so its sampled items are usually disjoint
-    # from both math_bench and robustness_bench in a given round.
-    _BENCH_POOLS["noise"] = _BENCH_POOLS["math"]
-
-    if verbose:
-        print(
-            f"[bench] pools loaded: "
-            f"math={len(_BENCH_POOLS['math'])}, "
-            f"code={len(_BENCH_POOLS['code'])}, "
-            f"reasoning={len(_BENCH_POOLS['reasoning'])}, "
-            f"knowledge={len(_BENCH_POOLS['knowledge'])}, "
-            f"ifeval={len(_BENCH_POOLS['ifeval'])}, "
-            f"aime={len(_BENCH_POOLS['aime'])}, "
-            f"mbpp={len(_BENCH_POOLS['mbpp'])}, "
-            f"tool_use={len(_BENCH_POOLS['tool_use'])}, "
-            f"self_consistency={len(_BENCH_POOLS['self_consistency'])}, "
-            f"arc={len(_BENCH_POOLS['arc'])}, "
-            f"truthful={len(_BENCH_POOLS['truthful'])}, "
-            f"long_context=procedural ({BENCH_LC_DISTRACTORS} distractors/item), "
-            f"procedural=procedural, "
-            f"robustness=alias(math), "
-            f"noise=alias(math)",
-            flush=True,
-        )
 
 
 def _coerce_block_seed(block_seed) -> int | None:
@@ -5282,176 +5881,224 @@ def _shuffle_bbh_mc_options(item: dict, block_seed) -> dict:
     return out
 
 
-def _pick_bench_items(bench_key: str, block_seed, k: int) -> list[dict]:
-    """Deterministic per-round sample from ``_BENCH_POOLS[bench_key]``.
-
-    Sampling is without replacement within a round (so per-round items
-    are distinct), but without any cross-round state (so different
-    rounds can sample the same item — miners cannot infer "we already
-    saw this one").
-
-    For the reasoning axis we do stratified sampling: at most one item
-    per BBH subtask per round to force breadth.
-    """
-    import random
-    pool = _BENCH_POOLS.get(bench_key) or []
-    if not pool:
-        return []
-    seed = _coerce_block_seed(block_seed)
-    if seed is None:
-        return list(pool[:k])
-    rng = random.Random(seed ^ _BENCH_STREAM.get(bench_key, 0))
-    if bench_key == "reasoning":
-        buckets: dict[str, list[dict]] = {}
-        for it in pool:
-            buckets.setdefault(it.get("src", "bbh/unknown"), []).append(it)
-        subs = list(buckets.keys())
-        rng.shuffle(subs)
-        picks: list[dict] = []
-        for sub in subs:
-            items = list(buckets[sub])
-            rng.shuffle(items)
-            if items:
-                picks.append(items[0])
-            if len(picks) >= k:
-                break
-        return picks[:k]
-    idxs = list(range(len(pool)))
-    rng.shuffle(idxs)
-    return [pool[i] for i in idxs[:min(k, len(pool))]]
+# Registry of every per-round bench item generator. Each entry is
+# ``(samples_key, generator_name, seed_xor_offset, n_items, extra_args)``;
+# the dispatcher resolves ``generator_name`` from the module's globals
+# (lazy lookup so the generators can stay defined later in the file
+# without tripping a forward-reference NameError at import time) and
+# loops once per round to populate ``_BENCH_SAMPLES``. The XOR offsets
+# keep procedural pools statistically independent across benches that
+# share the same generator (math → tool_use / self_consistency /
+# robustness / noise; code → mbpp).
+_BENCH_SAMPLE_GENERATORS: tuple[tuple[str, str, int, int, tuple], ...] = (
+    ("math", "_generate_math_items", 0, BENCH_MATH_PER_ROUND, ()),
+    ("code", "_generate_code_items", 0, BENCH_CODE_PER_ROUND, ()),
+    ("reasoning", "_generate_reasoning_items", 0, BENCH_REASONING_PER_ROUND, ()),
+    # ``knowledge_bench`` v2 (2026-04-29): replaces the legacy MC pool with
+    # procedural fact-like reasoning items (price tables, transitive
+    # ordering, container counting, alphabet/calendar/weekday/unit/roman
+    # conventions). Open-ended generation, regex-match grading, no MC
+    # random-pick floor — see ``_generate_knowledge_v2_items`` for the
+    # full subtype taxonomy.
+    ("knowledge", "_generate_knowledge_v2_items", 0, BENCH_KNOWLEDGE_PER_ROUND, ()),
+    ("ifeval", "_generate_ifeval_items", 0, BENCH_IFEVAL_PER_ROUND, ()),
+    ("aime", "_generate_aime_items", 0, BENCH_AIME_PER_ROUND, ()),
+    ("mbpp", "_generate_code_items", 0x4D42, BENCH_MBPP_PER_ROUND, ()),
+    ("tool_use", "_generate_math_items", 0x546F, BENCH_TOOL_USE_PER_ROUND, ()),
+    ("self_consistency", "_generate_math_items", 0x5343, BENCH_SELF_CONSISTENCY_PER_ROUND, ()),
+    ("arc", "_generate_mc_items", 0x4143, BENCH_ARC_PER_ROUND, ()),
+    ("truthful", "_generate_mc_items", 0x5452, BENCH_TRUTHFUL_PER_ROUND, ()),
+    # Session 3.5: long-context needle is procedural — generate fresh
+    # items per round so pools rotate but every validator sees the
+    # same items this round. Only generator with an extra positional
+    # arg (``n_distractors``).
+    ("long_context", "_generate_long_context_items", 0, BENCH_LC_PER_ROUND, (BENCH_LC_DISTRACTORS,)),
+    ("procedural", "_generate_procedural_items", 0, BENCH_PROCEDURAL_PER_ROUND, ()),
+    # v27: ``robustness`` and ``noise`` test paraphrase / typo
+    # invariance respectively. Disjoint stream offsets keep their pools
+    # independent from the canonical math pool above; the bench probes
+    # apply runtime perturbations to ground-truth math items.
+    ("robustness", "_generate_math_items", 0x524F, BENCH_ROBUSTNESS_PER_ROUND, ()),
+    ("noise", "_generate_math_items", 0x4E4F, BENCH_NOISE_PER_ROUND, ()),
+    # v29.2 — debug_bench (procedural buggy-code).
+    ("debug", "_generate_debug_items", 0, BENCH_DEBUG_PER_ROUND, ()),
+    # v29.4 — procedural correction (buggy code + error trace),
+    # multi-doc synthesis (cross-card retrieval), calibration (solvable
+    # + unsolvable), refactoring (style-constrained refactor).
+    ("correction", "_generate_correction_items", 0, BENCH_CORRECTION_PER_ROUND, ()),
+    ("multi_doc", "_generate_multi_doc_items", 0, BENCH_MULTI_DOC_PER_ROUND, ()),
+    ("calibration", "_generate_calibration_items", 0, BENCH_CALIBRATION_PER_ROUND, ()),
+    ("refactor", "_generate_refactor_items", 0, BENCH_REFACTOR_PER_ROUND, ()),
+    # v30 — pragmatic_bench (theory-of-mind + scalar implicature +
+    # speech-act items).
+    ("pragmatic", "_generate_pragmatic_items", 0, BENCH_PRAGMATIC_PER_ROUND, ()),
+    # v31 (2026-05-09 PROMOTED out of SHADOW) — 11-axis procedural
+    # surface. Each generator is a thin wrapper that imports the
+    # corresponding ``scripts/v31/*`` module and calls its
+    # ``generate_items(block_seed, n_items)``. Stream offsets here are
+    # zero; the underlying modules apply their own offsets (0x5631 -
+    # 0x563A) so the v31 pools are statistically independent from each
+    # other AND from the legacy v30 pools.
+    ("v31_gsm_symbolic", "_generate_v31_gsm_symbolic_items", 0, BENCH_V31_GSM_SYMBOLIC_PER_ROUND, ()),
+    ("v31_math_competition", "_generate_v31_math_competition_items", 0, BENCH_V31_MATH_COMPETITION_PER_ROUND, ()),
+    ("v31_math_robustness", "_generate_v31_math_robustness_items", 0, BENCH_V31_MATH_ROBUSTNESS_PER_ROUND, ()),
+    ("v31_code_plus", "_generate_v31_code_plus_items", 0, BENCH_V31_CODE_PLUS_PER_ROUND, ()),
+    ("v31_logic_grid", "_generate_v31_logic_grid_items", 0, BENCH_V31_LOGIC_GRID_PER_ROUND, ()),
+    ("v31_dyval", "_generate_v31_dyval_items", 0, BENCH_V31_DYVAL_PER_ROUND, ()),
+    ("v31_ruler", "_generate_v31_ruler_items", 0, BENCH_V31_RULER_PER_ROUND, ()),
+    ("v31_kg", "_generate_v31_kg_items", 0, BENCH_V31_KG_PER_ROUND, ()),
+    ("v31_ifeval", "_generate_v31_ifeval_items", 0, BENCH_V31_IFEVAL_PER_ROUND, ()),
+    ("v31_truthfulness", "_generate_v31_truthfulness_items", 0, BENCH_V31_TRUTHFULNESS_PER_ROUND, ()),
+    ("v31_consistency", "_generate_v31_consistency_items", 0, BENCH_V31_CONSISTENCY_PER_ROUND, ()),
+)
 
 
 def set_bench_block_seed(block_seed):
     """Regenerate per-round bench samples from the current block_seed.
 
-    Idempotent: no-op if already seeded with the same value. Loads the
-    pools on first call. Called once per round from ``main()`` right
-    after the other per-round setters.
+    Idempotent: no-op if already seeded with the same value. Called once
+    per round from ``main()`` right after the other per-round setters.
+
+    All generation goes through ``_BENCH_SAMPLE_GENERATORS`` (defined just
+    above) so adding a new bench is a one-line registry edit instead of a
+    fresh ``_BENCH_SAMPLES[name] = ...`` block plus a print-line append.
+
+    ── v27 Session 3.20 (2026-04-26 Goodhart hardening, full procedural switch) ──
+    Public-dataset items are unsafe: every (question, gold) pair is
+    discoverable on disk, so a miner can pre-compute answers for the
+    whole pool. v22-v26 paraphrase / option-shuffle rotated wording but
+    not semantics, so a {paraphrased_question → answer} lookup still
+    saturated the axis. v27 generates the bench items per round from
+    ``block_seed``: there is no offline dataset, so memorisation is not
+    available as a strategy. Round duration is unchanged because
+    per-item generation is microseconds. The public datasets remain
+    available for ``scripts/eval_pod/auto_benchmark.sh`` to run post-hoc
+    evalscope verification against the king on a separate pod, but the
+    validator never trains-or-evals against the public items.
     """
     global _BENCH_BLOCK_SEED
     if not BENCH_BATTERY_ENABLED:
         return
-    _bench_load_pools(verbose=(_BENCH_BLOCK_SEED != block_seed))
     if block_seed == _BENCH_BLOCK_SEED and all(_BENCH_SAMPLES[k] for k in _BENCH_SAMPLES):
         return
     _BENCH_BLOCK_SEED = block_seed
-    # ── v27 Session 3.20 (2026-04-26 Goodhart hardening, full procedural switch) ──
-    # Public-dataset items are unsafe: every (question, gold) pair is
-    # discoverable on disk, so a miner can pre-compute answers for the
-    # whole pool. v22-v26 paraphrase / option-shuffle rotated wording
-    # but not semantics, so a {paraphrased_question → answer} lookup
-    # still saturated the axis. v27 generates the bench items per round
-    # from ``block_seed``: there is no offline dataset, so memorisation
-    # is not even available as a strategy. Round duration is unchanged
-    # because per-item generation is microseconds. The public datasets
-    # remain available for ``scripts/eval_pod/auto_benchmark.sh`` to run
-    # post-hoc evalscope verification against the king on a separate
-    # pod, but the validator never trains-or-evals against the public
-    # items.
-    _BENCH_SAMPLES["math"] = _generate_math_items(block_seed, BENCH_MATH_PER_ROUND)
-    _BENCH_SAMPLES["code"] = _generate_code_items(block_seed, BENCH_CODE_PER_ROUND)
-    _BENCH_SAMPLES["reasoning"] = _generate_reasoning_items(
-        block_seed, BENCH_REASONING_PER_ROUND,
+    for key, gen_name, xor_off, n_items, extra_args in _BENCH_SAMPLE_GENERATORS:
+        gen = globals()[gen_name]
+        _BENCH_SAMPLES[key] = gen(block_seed ^ xor_off, n_items, *extra_args)
+    counts = ", ".join(
+        f"{key}={len(_BENCH_SAMPLES[key])}"
+        for key, *_ in _BENCH_SAMPLE_GENERATORS
     )
-    # ``knowledge_bench`` v2 (2026-04-29): replaces the legacy MC pool
-    # with procedural fact-like reasoning items (price tables, transitive
-    # ordering, container counting, alphabet/calendar/weekday/unit/roman
-    # conventions). Open-ended generation, regex-match grading, no MC
-    # random-pick floor. See ``_generate_knowledge_v2_items`` for the
-    # full subtype taxonomy. Items are 100% procedural — every
-    # (question, gold) pair is fresh per block_seed, no static pool to
-    # memorise.
-    _BENCH_SAMPLES["knowledge"] = _generate_knowledge_v2_items(
-        block_seed, BENCH_KNOWLEDGE_PER_ROUND,
-    )
-    _BENCH_SAMPLES["ifeval"] = _generate_ifeval_items(
-        block_seed, BENCH_IFEVAL_PER_ROUND,
-    )
-    _BENCH_SAMPLES["aime"] = _generate_aime_items(block_seed, BENCH_AIME_PER_ROUND)
-    _BENCH_SAMPLES["mbpp"] = _generate_code_items(
-        block_seed ^ 0x4D42, BENCH_MBPP_PER_ROUND,
-    )
-    _BENCH_SAMPLES["tool_use"] = _generate_math_items(
-        block_seed ^ 0x546F, BENCH_TOOL_USE_PER_ROUND,
-    )
-    _BENCH_SAMPLES["self_consistency"] = _generate_math_items(
-        block_seed ^ 0x5343, BENCH_SELF_CONSISTENCY_PER_ROUND,
-    )
-    _BENCH_SAMPLES["arc"] = _generate_mc_items(
-        block_seed ^ 0x4143, BENCH_ARC_PER_ROUND,
-    )
-    _BENCH_SAMPLES["truthful"] = _generate_mc_items(
-        block_seed ^ 0x5452, BENCH_TRUTHFUL_PER_ROUND,
-    )
-    # Session 3.5: long-context needle is procedural — generate fresh items
-    # per round from a seed mixed with the block_seed so pools rotate but
-    # every validator generates the same items this round.
-    _BENCH_SAMPLES["long_context"] = _generate_long_context_items(
-        block_seed, BENCH_LC_PER_ROUND, BENCH_LC_DISTRACTORS,
-    )
-    _BENCH_SAMPLES["procedural"] = _generate_procedural_items(
-        block_seed, BENCH_PROCEDURAL_PER_ROUND,
-    )
-    # v27: ``robustness`` and ``noise`` test paraphrase / typo invariance.
-    # We generate fresh procedural math items under disjoint stream
-    # offsets, then let ``robustness_bench_probe`` apply its runtime
-    # paraphrase and ``noise_resistance_bench_probe`` its runtime typo
-    # injection. The signal — "does the model still solve the same
-    # problem under wording perturbation / character noise?" — is
-    # preserved, but every (question, answer) pair is fresh per round.
-    _BENCH_SAMPLES["robustness"] = _generate_math_items(
-        block_seed ^ 0x524F, BENCH_ROBUSTNESS_PER_ROUND,
-    )
-    _BENCH_SAMPLES["noise"] = _generate_math_items(
-        block_seed ^ 0x4E4F, BENCH_NOISE_PER_ROUND,
-    )
-    # v29.2 — debug_bench. Procedural buggy-code items.
-    _BENCH_SAMPLES["debug"] = _generate_debug_items(
-        block_seed, BENCH_DEBUG_PER_ROUND,
-    )
-    # v29.4 — procedural correction (buggy code + error trace), multi-doc
-    # synthesis (cross-card retrieval), calibration (solvable +
-    # unsolvable), refactoring (style-constrained refactor).
-    _BENCH_SAMPLES["correction"] = _generate_correction_items(
-        block_seed, BENCH_CORRECTION_PER_ROUND,
-    )
-    _BENCH_SAMPLES["multi_doc"] = _generate_multi_doc_items(
-        block_seed, BENCH_MULTI_DOC_PER_ROUND,
-    )
-    _BENCH_SAMPLES["calibration"] = _generate_calibration_items(
-        block_seed, BENCH_CALIBRATION_PER_ROUND,
-    )
-    _BENCH_SAMPLES["refactor"] = _generate_refactor_items(
-        block_seed, BENCH_REFACTOR_PER_ROUND,
-    )
-    # v30 — pragmatic_bench (procedural theory-of-mind + scalar +
-    # speech-act items).
-    _BENCH_SAMPLES["pragmatic"] = _generate_pragmatic_items(
-        block_seed, BENCH_PRAGMATIC_PER_ROUND,
-    )
-    print(
-        f"[bench] round samples: math={len(_BENCH_SAMPLES['math'])}, "
-        f"code={len(_BENCH_SAMPLES['code'])}, "
-        f"reasoning={len(_BENCH_SAMPLES['reasoning'])}, "
-        f"knowledge={len(_BENCH_SAMPLES['knowledge'])}, "
-        f"ifeval={len(_BENCH_SAMPLES['ifeval'])}, "
-        f"aime={len(_BENCH_SAMPLES['aime'])}, "
-        f"mbpp={len(_BENCH_SAMPLES['mbpp'])}, "
-        f"tool_use={len(_BENCH_SAMPLES['tool_use'])}, "
-        f"self_consistency={len(_BENCH_SAMPLES['self_consistency'])}, "
-        f"arc={len(_BENCH_SAMPLES['arc'])}, "
-        f"truthful={len(_BENCH_SAMPLES['truthful'])}, "
-        f"long_context={len(_BENCH_SAMPLES['long_context'])}, "
-        f"procedural={len(_BENCH_SAMPLES['procedural'])}, "
-        f"robustness={len(_BENCH_SAMPLES['robustness'])}, "
-        f"noise={len(_BENCH_SAMPLES['noise'])}, "
-        f"debug={len(_BENCH_SAMPLES['debug'])}, "
-        f"pragmatic={len(_BENCH_SAMPLES['pragmatic'])}",
-        flush=True,
-    )
+    print(f"[bench] round samples: {counts}", flush=True)
 
 
 # ── bench generation helper (reuses chat template + eos/pad setup) ────
+
+# 2026-05-04: Per-student bench-budget multiplier. Set by the per-
+# student dispatcher (after chat_probe runs and we know the student's
+# derail status) and consumed by ``_bench_generate`` to scale the
+# per-axis ``max_new_tokens`` budgets. Default 1.0 = no change.
+#
+# When chat_probe detects a chronic derailer (term_rate < 0.25 AND
+# mean_gen at the chat-probe ceiling), we set this to 0.25. Rationale:
+#   • A model that fills the chat-probe budget on "hi" will fill the
+#     AIME budget on "compute the answer". The output is uniformly
+#     garbage past ~200 tokens; the answer-extractor finds nothing in
+#     either case.
+#   • Cutting BENCH_AIME_MAX_TOKENS from 1024→256 takes AIME from
+#     ~7 min/derailed student to ~1.8 min — same final pass_frac (0)
+#     in either case, just less wasted GPU time generating garbage.
+#   • Healthy students (term_rate >= 0.5 in chat_probe) are not
+#     affected because the multiplier defaults back to 1.0 between
+#     students.
+#
+# Stored as a module global so it propagates through ``run_bench_
+# battery`` → individual probes → ``_bench_generate`` without
+# threading a parameter through 17 probe signatures.
+_BENCH_TOKEN_BUDGET_FACTOR = 1.0
+
+
+@contextlib.contextmanager
+def _model_eval_no_grad(model):
+    """Context manager: put ``model`` into eval+no_grad, restore on exit.
+
+    Replaces the ``was_training = model.training; model.eval(); with
+    torch.no_grad(): ...; if was_training: model.train()`` pattern that
+    appears ~30 times across this file. The try/finally ensures the
+    training-state is restored even if the body raises (the inline
+    pattern silently leaves the model in eval mode on exception, which
+    can confuse downstream training code).
+    """
+    if model is None:
+        with torch.no_grad():
+            yield
+        return
+    was_training = model.training
+    model.eval()
+    try:
+        with torch.no_grad():
+            yield
+    finally:
+        if was_training:
+            model.train()
+
+
+def _eos_pad_ids(tokenizer) -> tuple[list[int] | None, int]:
+    """Return ``(eos_ids, pad_id)`` for greedy ``model.generate`` calls.
+
+    The pattern was duplicated 13 times across this file with minor
+    variations (tuple vs list, multi-line vs short-circuit pad fallback).
+    Centralising it removes ~120 LOC of boilerplate and means a future
+    teacher-tokenizer swap (e.g. dropping ``<|im_end|>`` for a Kimi-style
+    end token) only needs one edit.
+
+    The eos set is the union of the chat-template tokens we use
+    (``<|im_end|>``, ``<|endoftext|>``) and the tokenizer's own
+    ``eos_token_id``. Returns ``None`` for ``eos_ids`` if the tokenizer
+    knows no eos at all (theoretical — every real tokenizer we see has
+    one). ``pad_id`` falls back to the first eos_id (matches HF's own
+    GenerationConfig default) or 0.
+    """
+    eos_ids: list[int] = []
+    for tok in ("<|im_end|>", "<|endoftext|>"):
+        tid = tokenizer.convert_tokens_to_ids(tok)
+        if isinstance(tid, int) and tid >= 0:
+            eos_ids.append(tid)
+    if getattr(tokenizer, "eos_token_id", None) is not None:
+        eos_ids.append(int(tokenizer.eos_token_id))
+    eos_set = list(set(eos_ids)) or None
+    pad_id = getattr(tokenizer, "pad_token_id", None)
+    if pad_id is None:
+        pad_id = eos_set[0] if eos_set else 0
+    return eos_set, pad_id
+
+
+# 2026-05-05 (axes/evals/benchmarks thinking rollout):
+# Single global toggle for thinking-mode on the bench battery (math,
+# code, reasoning, knowledge, ifeval, aime, mbpp, tool-use, multi-doc,
+# calibration, pragmatic, knowledge, ifeval, ARC, robustness, noise,
+# procedural, truthful, long-context). Defaults ON so SN97's published
+# benchmark scores reward kings that actually think before answering —
+# the existing ``_strip_thinking_probe`` cleanup already removes
+# ``<think>...</think>`` blocks from bench output before scoring, so
+# enabling thinking is "free correctness" for any model trained to use
+# it (and a no-op for kings that ignore the flag — the chat template
+# just renders an extra ``<think>`` token that never closes, which is
+# stripped by `_strip_thinking_probe` before grading).
+#
+# We deliberately make ``_bench_generate`` IGNORE the per-call
+# ``enable_thinking`` argument and always honor the global. The
+# argument is kept for back-compat with old call sites (~17 callers
+# pass ``enable_thinking=False`` explicitly; rather than churn each
+# one we just override here). To run the legacy "no thinking" battery,
+# set ``BENCH_ENABLE_THINKING=0`` on the eval pod.
+#
+# Chat-shaped probes (chat_response_probe, capability_probe, chat_turns_probe,
+# judge_response_probe) also honor this global so the eval matches deployed
+# usage. Teacher-side graders keep thinking disabled when they need a compact
+# deterministic score-only response.
+BENCH_ENABLE_THINKING = os.environ.get("BENCH_ENABLE_THINKING", "1") != "0"
+
 
 def _bench_generate(model, tokenizer, prompt: str, max_new_tokens: int,
                     device: str, enable_thinking: bool = False) -> tuple[str, int]:
@@ -5459,20 +6106,22 @@ def _bench_generate(model, tokenizer, prompt: str, max_new_tokens: int,
 
     Uses the same eos/pad setup as the existing probes so behavior is
     identical to capability_probe / chat_response_probe.
+
+    NOTE: ``enable_thinking`` is overridden by the global
+    ``BENCH_ENABLE_THINKING`` env-controlled flag (see comment above).
+    Pass-through callers don't need to change.
     """
-    eos_ids = []
-    for tok in ("<|im_end|>", "<|endoftext|>"):
-        tid = tokenizer.convert_tokens_to_ids(tok)
-        if isinstance(tid, int) and tid >= 0:
-            eos_ids.append(tid)
-    if getattr(tokenizer, "eos_token_id", None) is not None:
-        eos_ids.append(int(tokenizer.eos_token_id))
-    eos_ids = list(set(eos_ids)) or None
-    pad_id = getattr(tokenizer, "pad_token_id", None) or (eos_ids[0] if eos_ids else 0)
-    rendered = _render_chat_prompt(tokenizer, prompt, enable_thinking=enable_thinking)
+    eos_ids, pad_id = _eos_pad_ids(tokenizer)
+    rendered = _render_chat_prompt(
+        tokenizer, prompt, enable_thinking=BENCH_ENABLE_THINKING,
+    )
     ids = tokenizer(rendered, return_tensors="pt").input_ids.to(device)
+    # Apply the derail-budget multiplier. Floor at 64 tokens so even
+    # short-answer probes (knowledge: 64 baseline → 16 with factor 0.25)
+    # don't shrink below the answer length itself.
+    effective_max = max(64, int(max_new_tokens * _BENCH_TOKEN_BUDGET_FACTOR))
     gen = model.generate(
-        ids, max_new_tokens=max_new_tokens,
+        ids, max_new_tokens=effective_max,
         do_sample=False, temperature=1.0, top_p=1.0,
         pad_token_id=pad_id, eos_token_id=eos_ids, use_cache=True,
     )
@@ -5630,39 +6279,697 @@ def _bench_finalize_token_stats(out: dict) -> None:
     }
 
 
-def math_bench_probe(model, tokenizer, device="cuda"):
+def _run_simple_bench(model, tokenizer, device, sample_key: str,
+                      max_tokens: int, prompt_fn, grade_fn,
+                      enable_thinking: bool = False) -> dict:
+    """Scaffolding for the per-item generate→grade→tally bench probes.
+
+    Every "simple" bench (math, aime, ifeval, knowledge, reasoning, arc,
+    truthful, procedural, …) used to copy/paste the same ~30-line block:
+    init out dict, fetch samples, eval+no_grad, per-item generate +
+    grade + append, finalize token stats. Centralising the scaffolding
+    removes ~600 LOC of boilerplate and means a future fix (per-item
+    timing, batched generation, side-channel logging) only needs one
+    edit.
+
+    The per-bench parts are:
+      * ``sample_key`` — index into ``_BENCH_SAMPLES``.
+      * ``max_tokens`` — generation budget for this axis.
+      * ``prompt_fn(item) -> str`` — render the user prompt.
+      * ``grade_fn(item, text, tok) -> (item_dict, ok_int)`` — grade
+        the generation and assemble the per-item record.
+
+    ``grade_fn`` is allowed to raise — the inner try/except records the
+    error on the item without aborting the rest of the batch. The outer
+    try/except sets ``out["error"]`` for catastrophic failures (model
+    load issue, tokenizer crash) so the bench drops cleanly out of the
+    composite instead of taking the round down.
+    """
     out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
-    samples = _BENCH_SAMPLES.get("math") or []
+    samples = _BENCH_SAMPLES.get(sample_key) or []
     if not samples or model is None or tokenizer is None:
         return out
     try:
-        was_training = model.training
-        model.eval()
-        with torch.no_grad():
+        with _model_eval_no_grad(model):
             for it in samples:
                 try:
-                    prompt_text = _math_format_prompt(it["question"], it.get("src", ""))
                     text, tok = _bench_generate(
-                        model, tokenizer, prompt_text,
-                        BENCH_MATH_MAX_TOKENS, device, enable_thinking=False,
+                        model, tokenizer, prompt_fn(it),
+                        max_tokens, device, enable_thinking=enable_thinking,
                     )
-                    pred = _math_extract_answer(text, it.get("src", ""))
-                    ok = _math_score_one(pred, it["gold"])
+                    item, ok = grade_fn(it, text, int(tok))
+                    out["items"].append(item)
+                    out["n"] += 1
+                    out["correct"] += int(ok)
+                except Exception as e:
+                    out["items"].append({"src": it.get("src", ""), "error": str(e)[:120]})
+        out["pass_frac"] = out["correct"] / max(1, out["n"])
+        _bench_finalize_token_stats(out)
+    except Exception as e:
+        out["error"] = str(e)[:200]
+    return out
+
+
+def _run_humaneval_sandbox_bench(
+    model, tokenizer, device, *,
+    sample_key: str,
+    max_tokens: int,
+    build_prompt,
+    build_sandbox_tuple=None,
+    extra_item_fields: tuple[str, ...] = (),
+    post_sandbox_hook=None,
+) -> dict:
+    """Scaffolding for the HumanEval-sandbox graded probes.
+
+    ``code_bench`` / ``debug_bench`` / ``correction_bench`` /
+    ``mbpp_bench`` / ``refactor_bench`` used to copy/paste the same
+    ~70-line block: import sandbox, generate per-item under
+    eval+no_grad, build sandbox input tuples, run ``hs.run_batch``,
+    then merge results back into ``out["items"]``. Centralising the
+    scaffolding removes ~300 LOC and means future fixes (sandbox worker
+    count tuning, batched generation, sandbox timeout knobs) only need
+    one edit.
+
+    Per-bench parts:
+      * ``sample_key`` — index into ``_BENCH_SAMPLES``.
+      * ``max_tokens`` — generation budget.
+      * ``build_prompt(item) -> str`` — render the user prompt.
+      * ``build_sandbox_tuple(gen, item) -> tuple`` — defaults to the
+        canonical ``(item["prompt"], gen, item["test"], item["entry_point"])``
+        used by ``code_bench`` / ``debug_bench`` / ``correction_bench``;
+        ``mbpp_bench`` overrides because its tests are bare asserts that
+        must be wrapped in ``def check(candidate):``.
+      * ``extra_item_fields`` — additional item-record fields to copy
+        through (e.g. ``("src",)`` for ``correction_bench`` per-template
+        telemetry).
+      * ``post_sandbox_hook(item, gen, sandbox_result) -> (ok, extra)`` —
+        called once per sandbox-graded item if non-None. ``ok`` is the
+        FINAL pass/fail (overrides the raw sandbox pass), ``extra`` is
+        a dict of additional item-record fields. ``refactor_bench`` uses
+        this to layer an AST-based style-constraint check on top of the
+        sandbox tests.
+    """
+    out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
+    samples = _BENCH_SAMPLES.get(sample_key) or []
+    if not samples or model is None or tokenizer is None:
+        return out
+    try:
+        import humaneval_sandbox as hs  # type: ignore
+    except ImportError:
+        out["error"] = "humaneval_sandbox not importable on pod"
+        return out
+    if build_sandbox_tuple is None:
+        def build_sandbox_tuple(gen, it):
+            return (it["prompt"], gen, it["test"], it["entry_point"])
+    try:
+        generations: list[tuple[str, int, dict]] = []
+        with _model_eval_no_grad(model):
+            for it in samples:
+                try:
+                    gen, tok = _bench_generate(
+                        model, tokenizer, build_prompt(it),
+                        max_tokens, device, enable_thinking=False,
+                    )
+                    generations.append((gen, int(tok), it))
+                except Exception as e:
+                    generations.append(("", 0, {**it, "gen_error": str(e)[:120]}))
+        sandbox_input = [
+            build_sandbox_tuple(_strip_thinking_probe(gen or ""), it)
+            for gen, _tok, it in generations if "gen_error" not in it
+        ]
+        sandbox_results = (
+            hs.run_batch(sandbox_input, max_workers=4) if sandbox_input else []
+        )
+        idx = 0
+        for gen, tok, it in generations:
+            extras = {f: it.get(f, "") for f in extra_item_fields}
+            if "gen_error" in it:
+                out["items"].append({
+                    **extras,
+                    "task_id": it.get("task_id"),
+                    "error": it["gen_error"],
+                })
+                continue
+            r = sandbox_results[idx] if idx < len(sandbox_results) else None
+            idx += 1
+            sandbox_ok = bool(r and r.passed)
+            if post_sandbox_hook is not None:
+                ok, hook_extras = post_sandbox_hook(it, gen, r)
+            else:
+                ok, hook_extras = sandbox_ok, {}
+            out["items"].append({
+                **extras,
+                **hook_extras,
+                "task_id": it.get("task_id"),
+                "entry_point": it.get("entry_point"),
+                "ok": bool(ok),
+                "gen_tokens": int(tok),
+                "reason": (r.reason if r else "no_result")[:120],
+                "tail": (gen or "")[-160:],
+            })
+            out["n"] += 1
+            out["correct"] += int(bool(ok))
+        out["pass_frac"] = out["correct"] / max(1, out["n"])
+        _bench_finalize_token_stats(out)
+    except Exception as e:
+        out["error"] = str(e)[:200]
+    return out
+
+
+def math_bench_probe(model, tokenizer, device="cuda"):
+    def _grade(it, text, tok):
+        pred = _math_extract_answer(text, it.get("src", ""))
+        ok = _math_score_one(pred, it["gold"])
+        return {
+            "src": it.get("src", ""),
+            "pred": pred[:80],
+            "gold": it["gold"][:40],
+            "ok": bool(ok),
+            "gen_tokens": tok,
+            "tail": text[-120:],
+        }, ok
+    return _run_simple_bench(
+        model, tokenizer, device, "math", BENCH_MATH_MAX_TOKENS,
+        prompt_fn=lambda it: _math_format_prompt(it["question"], it.get("src", "")),
+        grade_fn=_grade,
+    )
+
+
+def _v31_import(module_name: str):
+    """Import ``scripts.v31.<module_name>`` with pod-side fallback.
+
+    On the validator side the package layout is ``scripts/v31/<x>.py``
+    and ``from scripts.v31.<x> import generate_items`` works directly.
+    On the pod side the modules are uploaded by ``upload_aux_modules``
+    to ``<run_dir>/scripts/v31/<x>.py`` and the cwd is added to
+    ``sys.path`` so the same import resolves. When the v31 package
+    is missing (e.g. an old eval-pod image), we fall back to the
+    flat path ``v31_<x>.py`` so a manual hot-fix is still possible.
+
+    Returns the imported module's ``generate_items`` symbol.
+    """
+    try:
+        mod = __import__(f"scripts.v31.{module_name}", fromlist=["generate_items"])
+        return mod.generate_items
+    except Exception:
+        pass
+    try:
+        mod = __import__(f"v31_{module_name}", fromlist=["generate_items"])
+        return mod.generate_items
+    except Exception as exc:
+        raise ImportError(
+            f"v31 module {module_name!r} not available on this pod. "
+            "Re-deploy the validator (or run upload_aux_modules) so the "
+            "scripts/v31/ package lands at the eval run dir."
+        ) from exc
+
+
+def _generate_v31_gsm_symbolic_items(block_seed, n_items: int) -> list[dict]:
+    """Re-export for the dispatcher (``globals()[gen_name]`` lookup).
+
+    The actual generator lives in ``scripts/v31/math_gsm_symbolic.py``
+    so it can be unit-tested standalone (no validator deps). This
+    wrapper exists only so the registry's ``globals()[gen_name]``
+    lookup resolves the name from this module's namespace.
+    """
+    return _v31_import("math_gsm_symbolic")(block_seed, n_items)
+
+
+def _generate_v31_ifeval_items(block_seed, n_items: int) -> list[dict]:
+    """Re-export for the dispatcher.
+
+    Generator implementation: ``scripts/v31/ifeval_verifiable.py``.
+    Each item carries the full IFEval ``(instruction_ids, kwargs)``
+    contract, scored by the existing vendored grader at
+    ``scripts/ifeval_vendor.evaluate_item``.
+    """
+    return _v31_import("ifeval_verifiable")(block_seed, n_items)
+
+
+def _generate_v31_math_competition_items(block_seed, n_items: int) -> list[dict]:
+    """Re-export. Generator: ``scripts/v31/math_competition.py``."""
+    return _v31_import("math_competition")(block_seed, n_items)
+
+
+def _generate_v31_math_robustness_items(block_seed, n_items: int) -> list[dict]:
+    """Re-export. Generator: ``scripts/v31/math_robustness.py``.
+
+    Applies GSM-Plus 4-perturbation suite (numerical_swap, digit_expand,
+    context_pad, unit_swap) to v31 GSM-Symbolic base templates. Each
+    item is a paraphrase of an M1-style item with mechanically-
+    preserved gold.
+    """
+    return _v31_import("math_robustness")(block_seed, n_items)
+
+
+def _generate_v31_code_plus_items(block_seed, n_items: int) -> list[dict]:
+    """Re-export. Generator: ``scripts/v31/code_humaneval_plus.py``.
+
+    Returns items in the ``{prompt, test, entry_point, task_id}``
+    shape expected by ``_run_humaneval_sandbox_bench`` (used by
+    code_bench / mbpp_bench / debug_bench). The procedural function
+    name + 30-60 EvalPlus-style augmented test cases mean SOTA-level
+    HumanEval / MBPP memorization confers no advantage.
+    """
+    return _v31_import("code_humaneval_plus")(block_seed, n_items)
+
+
+def _generate_v31_logic_grid_items(block_seed, n_items: int) -> list[dict]:
+    """Re-export. Generator: ``scripts/v31/reasoning_logic_grid.py``."""
+    return _v31_import("reasoning_logic_grid")(block_seed, n_items)
+
+
+def _generate_v31_dyval_items(block_seed, n_items: int) -> list[dict]:
+    """Re-export. Generator: ``scripts/v31/reasoning_dyval_arith.py``."""
+    return _v31_import("reasoning_dyval_arith")(block_seed, n_items)
+
+
+def _generate_v31_ruler_items(block_seed, n_items: int) -> list[dict]:
+    """Re-export. Generator: ``scripts/v31/long_context_ruler.py``."""
+    return _v31_import("long_context_ruler")(block_seed, n_items)
+
+
+def _generate_v31_kg_items(block_seed, n_items: int) -> list[dict]:
+    """Re-export. Generator: ``scripts/v31/knowledge_multi_hop_kg.py``."""
+    return _v31_import("knowledge_multi_hop_kg")(block_seed, n_items)
+
+
+def _generate_v31_truthfulness_items(block_seed, n_items: int) -> list[dict]:
+    """Re-export. Generator: ``scripts/v31/truthfulness_calibration.py``.
+
+    Items mix 50% determinate (gold = integer) and 50% indeterminate
+    (gold = "cannot determine") items so the calibration grader can
+    score correct / incorrect / not_attempted per SimpleQA methodology.
+    """
+    return _v31_import("truthfulness_calibration")(block_seed, n_items)
+
+
+def _generate_v31_consistency_items(block_seed, n_items: int) -> list[dict]:
+    """Re-export. Generator: ``scripts/v31/consistency_paraphrase.py``.
+
+    Each item carries TWO questions (``question`` and ``question_b``).
+    The bench probe generates one response per variant and scores via
+    ``consistency_score`` (3-way: 1.0 / 0.5 / 0.0).
+    """
+    return _v31_import("consistency_paraphrase")(block_seed, n_items)
+
+
+def v31_gsm_symbolic_bench_probe(model, tokenizer, device="cuda"):
+    """v31 procedural math axis — Apple GSM-Symbolic methodology.
+
+    Items come from ``_BENCH_SAMPLES["v31_gsm_symbolic"]`` (populated
+    per round by ``_generate_v31_gsm_symbolic_items`` via the dispatcher
+    in ``set_bench_block_seed``). Grading reuses ``_math_extract_answer``
+    + ``_math_score_one`` — items emit the standard ``#### N`` answer
+    marker, so the existing math grader scores them unchanged.
+
+    SHADOW status (2026-05-09 v31 sprint 1): this probe runs only when
+    ``BENCH_V31_GSM_SYMBOLIC_PER_ROUND > 0`` AND
+    ``BENCH_BATTERY_SHADOW_AXES=1``. When the per-round count is 0 the
+    sample list stays empty so the probe returns ``n=0`` and the axis
+    drops out of composite scoring. Composite weight is 0 in
+    ``composite.py`` regardless — the axis appears in the axes dict
+    for telemetry / correlation analysis but does not gate ranking.
+
+    See ``reports/2026-05-09-v31-procedural-redesign.md`` §M1 for the
+    promotion gate (Pearson r ≥ 0.5 vs canary_gsm8k on ≥ 4 paired
+    UIDs, reference-floor in [0.30, 0.80], std-dev < 0.10).
+    """
+
+    def _grade(it, text, tok):
+        pred = _math_extract_answer(text, it.get("src", ""))
+        ok = _math_score_one(pred, it["gold"])
+        return {
+            "src": it.get("src", ""),
+            "pred": pred[:80],
+            "gold": it["gold"][:40],
+            "ok": bool(ok),
+            "gen_tokens": tok,
+            "tail": text[-120:],
+            "difficulty": it.get("difficulty"),
+            "is_noop": it.get("is_noop"),
+            "template": it.get("template"),
+        }, ok
+
+    return _run_simple_bench(
+        model, tokenizer, device, "v31_gsm_symbolic",
+        BENCH_V31_GSM_SYMBOLIC_MAX_TOKENS,
+        prompt_fn=lambda it: _math_format_prompt(it["question"], it.get("src", "")),
+        grade_fn=_grade,
+    )
+
+
+def v31_ifeval_verifiable_bench_probe(model, tokenizer, device="cuda"):
+    """v31 procedural instruction-following axis — Google IFEval methodology.
+
+    Items come from ``_BENCH_SAMPLES["v31_ifeval"]`` (populated per
+    round by ``_generate_v31_ifeval_items``). Grading delegates to
+    the vendored Google IFEval grader at
+    ``scripts/ifeval_vendor.evaluate_item`` — the same grader used by
+    ``ifeval_bench_probe``, so cross-axis comparisons are apples-to-apples.
+
+    The v31 generator widens the verifier surface (21 verifiers vs the
+    13 used by the v30 ``ifeval_bench``) and the stack-depth tail
+    (1-4 stacked constraints vs 1-3) to better track the held-out
+    IFEval canary. SHADOW until the promotion gate fires (see
+    ``reports/2026-05-09-v31-procedural-redesign.md`` §I1).
+    """
+    out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
+    samples = _BENCH_SAMPLES.get("v31_ifeval") or []
+    if not samples or model is None or tokenizer is None:
+        return out
+    try:
+        import ifeval_vendor as _ifev  # type: ignore
+    except ImportError:
+        out["error"] = "ifeval_vendor not importable on pod"
+        return out
+    try:
+        with _model_eval_no_grad(model):
+            for it in samples:
+                try:
+                    text, tok = _bench_generate(
+                        model, tokenizer, it["prompt"],
+                        BENCH_V31_IFEVAL_MAX_TOKENS, device,
+                        enable_thinking=False,
+                    )
+                    cleaned = _strip_thinking_probe(text or "")
+                    all_pass, per = _ifev.evaluate_item(
+                        cleaned, it["instruction_ids"], it.get("kwargs") or [],
+                    )
                     out["items"].append({
                         "src": it.get("src", ""),
-                        "pred": pred[:80],
-                        "gold": it["gold"][:40],
-                        "ok": bool(ok),
+                        "instruction_ids": it["instruction_ids"],
+                        "per_instruction": per,
+                        "stack_depth": it.get("stack_depth"),
+                        "ok": bool(all_pass),
                         "gen_tokens": int(tok),
                         "tail": text[-120:],
                     })
                     out["n"] += 1
-                    out["correct"] += ok
+                    out["correct"] += int(all_pass)
                 except Exception as e:
                     out["items"].append({"src": it.get("src", ""), "error": str(e)[:120]})
-        if was_training:
-            model.train()
         out["pass_frac"] = out["correct"] / max(1, out["n"])
+        _bench_finalize_token_stats(out)
+    except Exception as e:
+        out["error"] = str(e)[:200]
+    return out
+
+
+# ── v31 procedural axes (PRODUCTION 2026-05-09) ─────────────────────
+
+
+def v31_math_competition_bench_probe(model, tokenizer, device="cuda"):
+    """v31 procedural competition-math axis (algebra / number theory /
+    combinatorics / geometry / probability). Items emit gold as either
+    integer (most templates) or simplified fraction p/q (probability
+    templates). Grading uses ``scripts.v31.math_competition.grade_response``
+    which canonicalizes fractions to lowest terms before comparison.
+    """
+    from scripts.v31.math_competition import grade_response as _grade_fn
+
+    def _grade(it, text, tok):
+        ok = _grade_fn(text, it["gold"])
+        return {
+            "src": it.get("src", ""),
+            "gold": str(it["gold"])[:40],
+            "ok": bool(ok),
+            "gen_tokens": tok,
+            "tail": text[-120:],
+            "family": it.get("family"),
+            "template": it.get("template"),
+        }, ok
+
+    return _run_simple_bench(
+        model, tokenizer, device, "v31_math_competition",
+        BENCH_V31_MATH_COMPETITION_MAX_TOKENS,
+        prompt_fn=lambda it: it["question"],
+        grade_fn=_grade,
+    )
+
+
+def v31_math_robustness_bench_probe(model, tokenizer, device="cuda"):
+    """v31 procedural math-robustness axis (GSM-Plus 4-perturbation
+    suite). Items use the same ``#### N`` answer marker as M1, so the
+    existing math grader scores them unchanged. Per-perturbation
+    pass-rate appears in ``per_src`` telemetry.
+    """
+
+    def _grade(it, text, tok):
+        pred = _math_extract_answer(text, it.get("src", ""))
+        ok = _math_score_one(pred, it["gold"])
+        return {
+            "src": it.get("src", ""),
+            "pred": pred[:80],
+            "gold": it["gold"][:40],
+            "ok": bool(ok),
+            "gen_tokens": tok,
+            "tail": text[-120:],
+            "perturbation": it.get("perturbation"),
+            "template": it.get("template"),
+        }, ok
+
+    return _run_simple_bench(
+        model, tokenizer, device, "v31_math_robustness",
+        BENCH_V31_MATH_ROBUSTNESS_MAX_TOKENS,
+        prompt_fn=lambda it: _math_format_prompt(it["question"], it.get("src", "")),
+        grade_fn=_grade,
+    )
+
+
+def v31_code_humaneval_plus_bench_probe(model, tokenizer, device="cuda"):
+    """v31 procedural code axis (EvalPlus-style 30-60 augmented tests).
+    Reuses the existing ``_run_humaneval_sandbox_bench`` scaffold; the
+    procedural items have the same {prompt, test, entry_point,
+    task_id} shape as ``code_bench`` so all sandbox infrastructure
+    applies unchanged.
+    """
+    def _build_prompt(it):
+        return (
+            "Complete the following Python function. Output ONLY the "
+            "function body (no extra explanation, no markdown fences, "
+            f"no surrounding code).\n\n{it['prompt']}"
+        )
+    return _run_humaneval_sandbox_bench(
+        model, tokenizer, device,
+        sample_key="v31_code_plus",
+        max_tokens=BENCH_V31_CODE_PLUS_MAX_TOKENS,
+        build_prompt=_build_prompt,
+        extra_item_fields=("src", "template"),
+    )
+
+
+def v31_reasoning_logic_grid_bench_probe(model, tokenizer, device="cuda"):
+    """v31 Zebra-puzzle reasoning axis. Single-word answer grader."""
+    from scripts.v31.reasoning_logic_grid import grade_response as _grade_fn
+
+    def _grade(it, text, tok):
+        ok = _grade_fn(text, it["gold"])
+        return {
+            "src": it.get("src", ""),
+            "gold": str(it["gold"])[:40],
+            "ok": bool(ok),
+            "gen_tokens": tok,
+            "tail": text[-120:],
+            "num_people": it.get("num_people"),
+            "num_attrs": it.get("num_attrs"),
+            "num_clues": it.get("num_clues"),
+        }, ok
+
+    return _run_simple_bench(
+        model, tokenizer, device, "v31_logic_grid",
+        BENCH_V31_LOGIC_GRID_MAX_TOKENS,
+        prompt_fn=lambda it: it["question"],
+        grade_fn=_grade,
+    )
+
+
+def v31_reasoning_dyval_arith_bench_probe(model, tokenizer, device="cuda"):
+    """v31 DyVal arithmetic-DAG reasoning axis."""
+    from scripts.v31.reasoning_dyval_arith import grade_response as _grade_fn
+
+    def _grade(it, text, tok):
+        ok = _grade_fn(text, it["gold"])
+        return {
+            "src": it.get("src", ""),
+            "gold": str(it["gold"])[:40],
+            "ok": bool(ok),
+            "gen_tokens": tok,
+            "tail": text[-120:],
+            "depth": it.get("depth"),
+            "mode": it.get("mode"),
+        }, ok
+
+    return _run_simple_bench(
+        model, tokenizer, device, "v31_dyval",
+        BENCH_V31_DYVAL_MAX_TOKENS,
+        prompt_fn=lambda it: it["question"],
+        grade_fn=_grade,
+    )
+
+
+def v31_long_context_ruler_bench_probe(model, tokenizer, device="cuda"):
+    """v31 RULER long-context axis (4 of 13 NVIDIA tasks)."""
+    from scripts.v31.long_context_ruler import grade_response as _grade_fn
+
+    def _grade(it, text, tok):
+        ok = _grade_fn(text, it["gold"])
+        return {
+            "src": it.get("src", ""),
+            "gold": str(it["gold"])[:40],
+            "ok": bool(ok),
+            "gen_tokens": tok,
+            "tail": text[-120:],
+            "task": it.get("task"),
+        }, ok
+
+    return _run_simple_bench(
+        model, tokenizer, device, "v31_ruler",
+        BENCH_V31_RULER_MAX_TOKENS,
+        prompt_fn=lambda it: it["question"],
+        grade_fn=_grade,
+    )
+
+
+def v31_knowledge_multi_hop_kg_bench_probe(model, tokenizer, device="cuda"):
+    """v31 procedural multi-hop KG axis (synthetic-entity, fully
+    procedural, NO real-world fact dependencies)."""
+    from scripts.v31.knowledge_multi_hop_kg import grade_response as _grade_fn
+
+    def _grade(it, text, tok):
+        ok = _grade_fn(
+            text, it["gold"],
+            all_correct=it.get("all_correct_answers") or [],
+        )
+        return {
+            "src": it.get("src", ""),
+            "gold": str(it["gold"])[:40],
+            "ok": bool(ok),
+            "gen_tokens": tok,
+            "tail": text[-120:],
+            "task": it.get("task"),
+        }, ok
+
+    return _run_simple_bench(
+        model, tokenizer, device, "v31_kg",
+        BENCH_V31_KG_MAX_TOKENS,
+        prompt_fn=lambda it: it["question"],
+        grade_fn=_grade,
+    )
+
+
+def v31_truthfulness_calibration_bench_probe(model, tokenizer, device="cuda"):
+    """v31 SimpleQA-style 3-way calibration axis.
+
+    Per-item classification: correct / incorrect / not_attempted. The
+    axis ``pass_frac`` is the SimpleQA-normalized score
+    ``(num_correct - num_incorrect) / num_items`` mapped to [0, 1] -
+    confidently-wrong responses are penalized vs honest abstentions.
+    """
+    from scripts.v31.truthfulness_calibration import classify_response
+
+    out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
+    samples = _BENCH_SAMPLES.get("v31_truthfulness") or []
+    if not samples or model is None or tokenizer is None:
+        return out
+    try:
+        n_correct = 0
+        n_incorrect = 0
+        n_not_att = 0
+        with _model_eval_no_grad(model):
+            for it in samples:
+                try:
+                    text, tok = _bench_generate(
+                        model, tokenizer, it["question"],
+                        BENCH_V31_TRUTHFULNESS_MAX_TOKENS, device,
+                        enable_thinking=False,
+                    )
+                    cleaned = _strip_thinking_probe(text or "")
+                    cls = classify_response(cleaned, it["gold"])
+                    if cls == "correct":
+                        n_correct += 1
+                    elif cls == "incorrect":
+                        n_incorrect += 1
+                    else:
+                        n_not_att += 1
+                    out["items"].append({
+                        "src": it.get("src", ""),
+                        "gold": str(it["gold"])[:40],
+                        "classification": cls,
+                        "ok": cls == "correct",
+                        "gen_tokens": int(tok),
+                        "tail": text[-120:],
+                        "family": it.get("family"),
+                    })
+                    out["n"] += 1
+                except Exception as e:
+                    out["items"].append({
+                        "src": it.get("src", ""), "error": str(e)[:120],
+                    })
+        # SimpleQA calibration score, normalized to [0, 1].
+        if out["n"] > 0:
+            raw = (n_correct - n_incorrect) / out["n"]  # in [-1, 1]
+            out["pass_frac"] = max(0.0, min(1.0, (raw + 1.0) / 2.0))
+        out["correct"] = n_correct
+        out["incorrect"] = n_incorrect
+        out["not_attempted"] = n_not_att
+        _bench_finalize_token_stats(out)
+    except Exception as e:
+        out["error"] = str(e)[:200]
+    return out
+
+
+def v31_consistency_paraphrase_bench_probe(model, tokenizer, device="cuda"):
+    """v31 paraphrase-pair consistency axis.
+
+    For each item, generate ONE response per variant (a / b) and score
+    via ``consistency_score`` -- 1.0 if both correct, 0.5 if exactly
+    one correct, 0.0 if neither correct. Per-item scores average to
+    the axis ``pass_frac``.
+    """
+    from scripts.v31.consistency_paraphrase import consistency_score
+
+    out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
+    samples = _BENCH_SAMPLES.get("v31_consistency") or []
+    if not samples or model is None or tokenizer is None:
+        return out
+    try:
+        total_score = 0.0
+        with _model_eval_no_grad(model):
+            for it in samples:
+                try:
+                    a_text, a_tok = _bench_generate(
+                        model, tokenizer,
+                        _math_format_prompt(it["question"], it.get("src", "")),
+                        BENCH_V31_CONSISTENCY_MAX_TOKENS, device,
+                        enable_thinking=False,
+                    )
+                    b_text, b_tok = _bench_generate(
+                        model, tokenizer,
+                        _math_format_prompt(it["question_b"], it.get("src", "")),
+                        BENCH_V31_CONSISTENCY_MAX_TOKENS, device,
+                        enable_thinking=False,
+                    )
+                    score = consistency_score(a_text, b_text, it["gold"])
+                    total_score += score
+                    out["items"].append({
+                        "src": it.get("src", ""),
+                        "gold": str(it["gold"])[:40],
+                        "ok": score == 1.0,
+                        "score": score,
+                        "gen_tokens": int(a_tok + b_tok),
+                        "tail_a": a_text[-80:],
+                        "tail_b": b_text[-80:],
+                        "template": it.get("template"),
+                    })
+                    out["n"] += 1
+                    out["correct"] += int(score == 1.0)
+                except Exception as e:
+                    out["items"].append({
+                        "src": it.get("src", ""), "error": str(e)[:120],
+                    })
+        if out["n"] > 0:
+            out["pass_frac"] = total_score / out["n"]
         _bench_finalize_token_stats(out)
     except Exception as e:
         out["error"] = str(e)[:200]
@@ -5672,66 +6979,22 @@ def math_bench_probe(model, tokenizer, device="cuda"):
 # ── code_bench ─────────────────────────────────────────────────────────
 
 def code_bench_probe(model, tokenizer, device="cuda"):
-    out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
-    samples = _BENCH_SAMPLES.get("code") or []
-    if not samples or model is None or tokenizer is None:
-        return out
-    try:
-        import humaneval_sandbox as hs  # type: ignore
-    except ImportError:
-        out["error"] = "humaneval_sandbox not importable on pod"
-        return out
-    try:
-        generations: list[tuple[str, dict]] = []
-        was_training = model.training
-        model.eval()
-        with torch.no_grad():
-            for it in samples:
-                try:
-                    prompt_text = (
-                        "Complete the following Python function. "
-                        "Output only the function body (no extra explanation, no markdown fences).\n\n"
-                        f"{it['prompt']}"
-                    )
-                    gen, tok = _bench_generate(
-                        model, tokenizer, prompt_text,
-                        BENCH_CODE_MAX_TOKENS, device, enable_thinking=False,
-                    )
-                    generations.append((gen, int(tok), it))
-                except Exception as e:
-                    generations.append(("", 0, {**it, "gen_error": str(e)[:120]}))
-        if was_training:
-            model.train()
-        sandbox_input = [
-            (it["prompt"], _strip_thinking_probe(gen or ""), it["test"], it["entry_point"])
-            for gen, _tok, it in generations if "gen_error" not in it
-        ]
-        sandbox_results = hs.run_batch(sandbox_input, max_workers=4) if sandbox_input else []
-        idx = 0
-        for gen, tok, it in generations:
-            if "gen_error" in it:
-                out["items"].append({
-                    "task_id": it.get("task_id"), "error": it["gen_error"],
-                })
-                continue
-            r = sandbox_results[idx] if idx < len(sandbox_results) else None
-            idx += 1
-            ok = bool(r and r.passed)
-            out["items"].append({
-                "task_id": it.get("task_id"),
-                "entry_point": it.get("entry_point"),
-                "ok": ok,
-                "gen_tokens": int(tok),
-                "reason": (r.reason if r else "no_result")[:120],
-                "tail": (gen or "")[-160:],
-            })
-            out["n"] += 1
-            out["correct"] += int(ok)
-        out["pass_frac"] = out["correct"] / max(1, out["n"])
-        _bench_finalize_token_stats(out)
-    except Exception as e:
-        out["error"] = str(e)[:200]
-    return out
+    """Run the code_bench probe (HumanEval-style code completion).
+
+    Prompt = "Complete the following Python function" + problem signature
+    + docstring. Sandbox graded via :func:`_run_humaneval_sandbox_bench`.
+    """
+    def _build_prompt(it):
+        return (
+            "Complete the following Python function. "
+            "Output only the function body (no extra explanation, no "
+            f"markdown fences).\n\n{it['prompt']}"
+        )
+    return _run_humaneval_sandbox_bench(
+        model, tokenizer, device,
+        sample_key="code", max_tokens=BENCH_CODE_MAX_TOKENS,
+        build_prompt=_build_prompt,
+    )
 
 
 def debug_bench_probe(model, tokenizer, device="cuda"):
@@ -5746,67 +7009,17 @@ def debug_bench_probe(model, tokenizer, device="cuda"):
     apply because the prompt ends mid-``def`` block exactly like
     ``code_bench``.
     """
-    out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
-    samples = _BENCH_SAMPLES.get("debug") or []
-    if not samples or model is None or tokenizer is None:
-        return out
-    try:
-        import humaneval_sandbox as hs  # type: ignore
-    except ImportError:
-        out["error"] = "humaneval_sandbox not importable on pod"
-        return out
-    try:
-        generations: list[tuple[str, dict]] = []
-        was_training = model.training
-        model.eval()
-        with torch.no_grad():
-            for it in samples:
-                try:
-                    prompt_text = (
-                        "Fix the bug in the following Python function. "
-                        "Output only the function body (no extra "
-                        "explanation, no markdown fences).\n\n"
-                        f"{it['prompt']}"
-                    )
-                    gen, tok = _bench_generate(
-                        model, tokenizer, prompt_text,
-                        BENCH_DEBUG_MAX_TOKENS, device, enable_thinking=False,
-                    )
-                    generations.append((gen, int(tok), it))
-                except Exception as e:
-                    generations.append(("", 0, {**it, "gen_error": str(e)[:120]}))
-        if was_training:
-            model.train()
-        sandbox_input = [
-            (it["prompt"], _strip_thinking_probe(gen or ""), it["test"], it["entry_point"])
-            for gen, _tok, it in generations if "gen_error" not in it
-        ]
-        sandbox_results = hs.run_batch(sandbox_input, max_workers=4) if sandbox_input else []
-        idx = 0
-        for gen, tok, it in generations:
-            if "gen_error" in it:
-                out["items"].append({
-                    "task_id": it.get("task_id"), "error": it["gen_error"],
-                })
-                continue
-            r = sandbox_results[idx] if idx < len(sandbox_results) else None
-            idx += 1
-            ok = bool(r and r.passed)
-            out["items"].append({
-                "task_id": it.get("task_id"),
-                "entry_point": it.get("entry_point"),
-                "ok": ok,
-                "gen_tokens": int(tok),
-                "reason": (r.reason if r else "no_result")[:120],
-                "tail": (gen or "")[-160:],
-            })
-            out["n"] += 1
-            out["correct"] += int(ok)
-        out["pass_frac"] = out["correct"] / max(1, out["n"])
-        _bench_finalize_token_stats(out)
-    except Exception as e:
-        out["error"] = str(e)[:200]
-    return out
+    def _build_prompt(it):
+        return (
+            "Fix the bug in the following Python function. "
+            "Output only the function body (no extra explanation, no "
+            f"markdown fences).\n\n{it['prompt']}"
+        )
+    return _run_humaneval_sandbox_bench(
+        model, tokenizer, device,
+        sample_key="debug", max_tokens=BENCH_DEBUG_MAX_TOKENS,
+        build_prompt=_build_prompt,
+    )
 
 
 # ── correction_bench (v29.4) ─────────────────────────────────────────────
@@ -5818,71 +7031,22 @@ def correction_bench_probe(model, tokenizer, device="cuda"):
     the prompt embeds a buggy reference (commented out) + an explicit
     error trace + the fresh signature; the model emits the corrected
     body. Item-level pass = sandbox runs the corrected function and all
-    asserts pass.
+    asserts pass. ``src`` is propagated through ``extra_item_fields`` so
+    per-template saturation telemetry can break out which subtypes are
+    saturated vs floored.
     """
-    out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
-    samples = _BENCH_SAMPLES.get("correction") or []
-    if not samples or model is None or tokenizer is None:
-        return out
-    try:
-        import humaneval_sandbox as hs  # type: ignore
-    except ImportError:
-        out["error"] = "humaneval_sandbox not importable on pod"
-        return out
-    try:
-        generations: list[tuple[str, int, dict]] = []
-        was_training = model.training
-        model.eval()
-        with torch.no_grad():
-            for it in samples:
-                try:
-                    prompt_text = (
-                        "Read the test failure trace and fix the bug. "
-                        "Output only the corrected function body (no extra "
-                        "explanation, no markdown fences).\n\n"
-                        f"{it['prompt']}"
-                    )
-                    gen, tok = _bench_generate(
-                        model, tokenizer, prompt_text,
-                        BENCH_CORRECTION_MAX_TOKENS, device, enable_thinking=False,
-                    )
-                    generations.append((gen, int(tok), it))
-                except Exception as e:
-                    generations.append(("", 0, {**it, "gen_error": str(e)[:120]}))
-        if was_training:
-            model.train()
-        sandbox_input = [
-            (it["prompt"], _strip_thinking_probe(gen or ""), it["test"], it["entry_point"])
-            for gen, _tok, it in generations if "gen_error" not in it
-        ]
-        sandbox_results = hs.run_batch(sandbox_input, max_workers=4) if sandbox_input else []
-        idx = 0
-        for gen, tok, it in generations:
-            if "gen_error" in it:
-                out["items"].append({
-                    "src": it.get("src", ""),
-                    "task_id": it.get("task_id"), "error": it["gen_error"],
-                })
-                continue
-            r = sandbox_results[idx] if idx < len(sandbox_results) else None
-            idx += 1
-            ok = bool(r and r.passed)
-            out["items"].append({
-                "src": it.get("src", ""),
-                "task_id": it.get("task_id"),
-                "entry_point": it.get("entry_point"),
-                "ok": ok,
-                "gen_tokens": int(tok),
-                "reason": (r.reason if r else "no_result")[:120],
-                "tail": (gen or "")[-160:],
-            })
-            out["n"] += 1
-            out["correct"] += int(ok)
-        out["pass_frac"] = out["correct"] / max(1, out["n"])
-        _bench_finalize_token_stats(out)
-    except Exception as e:
-        out["error"] = str(e)[:200]
-    return out
+    def _build_prompt(it):
+        return (
+            "Read the test failure trace and fix the bug. "
+            "Output only the corrected function body (no extra "
+            f"explanation, no markdown fences).\n\n{it['prompt']}"
+        )
+    return _run_humaneval_sandbox_bench(
+        model, tokenizer, device,
+        sample_key="correction", max_tokens=BENCH_CORRECTION_MAX_TOKENS,
+        build_prompt=_build_prompt,
+        extra_item_fields=("src",),
+    )
 
 
 # ── multi_doc_synthesis_bench (v29.4) ───────────────────────────────────
@@ -5990,9 +7154,7 @@ def calibration_bench_probe(model, tokenizer, device="cuda"):
     if not samples or model is None or tokenizer is None:
         return out
     try:
-        was_training = model.training
-        model.eval()
-        with torch.no_grad():
+        with _model_eval_no_grad(model):
             for it in samples:
                 try:
                     prompt_text = (
@@ -6019,28 +7181,21 @@ def calibration_bench_probe(model, tokenizer, device="cuda"):
                         "gen_tokens": int(tok),
                     })
                     out["n"] += 1
-                    if kind == "solv":
-                        out["n_solv"] += 1
-                        if ok:
-                            out["correct_solv"] += 1
-                    else:
-                        out["n_unsolv"] += 1
-                        if ok:
-                            out["correct_unsolv"] += 1
+                    bucket = "solv" if kind == "solv" else "unsolv"
+                    out[f"n_{bucket}"] += 1
+                    if ok:
+                        out[f"correct_{bucket}"] += 1
                     out["correct"] += int(ok)
                 except Exception as e:
                     out["items"].append({"src": it.get("src", ""), "error": str(e)[:120]})
-        if was_training:
-            model.train()
         out["pass_frac"] = out["correct"] / max(1, out["n"])
         # Per-half pass-fracs surface in telemetry so we can tell which
         # half a model is failing on (always-refuse vs always-confabulate).
-        out["solv_pass_frac"] = (
-            out["correct_solv"] / out["n_solv"] if out["n_solv"] else 0.0
-        )
-        out["unsolv_pass_frac"] = (
-            out["correct_unsolv"] / out["n_unsolv"] if out["n_unsolv"] else 0.0
-        )
+        for bucket in ("solv", "unsolv"):
+            n = out[f"n_{bucket}"]
+            out[f"{bucket}_pass_frac"] = (
+                out[f"correct_{bucket}"] / n if n else 0.0
+            )
         _bench_finalize_token_stats(out)
     except Exception as e:
         out["error"] = str(e)[:200]
@@ -6120,91 +7275,53 @@ def _refactor_check_constraint(model_code: str, item: dict) -> tuple[bool, str]:
 
 
 def refactor_bench_probe(model, tokenizer, device="cuda"):
-    """Run the refactor_bench probe (v29.4 — preserve behavior + style constraint)."""
-    out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
-    samples = _BENCH_SAMPLES.get("refactor") or []
-    if not samples or model is None or tokenizer is None:
-        return out
-    try:
-        import humaneval_sandbox as hs  # type: ignore
-    except ImportError:
-        out["error"] = "humaneval_sandbox not importable on pod"
-        return out
-    try:
-        generations: list[tuple[str, int, dict]] = []
-        was_training = model.training
-        model.eval()
-        with torch.no_grad():
-            for it in samples:
-                try:
-                    prompt_text = (
-                        "Refactor the function shown. Your refactor must "
-                        "preserve behaviour AND meet the style constraint. "
-                        "Output only the function (signature + body), no "
-                        "extra explanation.\n\n"
-                        f"{it['prompt']}"
-                    )
-                    gen, tok = _bench_generate(
-                        model, tokenizer, prompt_text,
-                        BENCH_REFACTOR_MAX_TOKENS, device, enable_thinking=False,
-                    )
-                    generations.append((gen, int(tok), it))
-                except Exception as e:
-                    generations.append(("", 0, {**it, "gen_error": str(e)[:120]}))
-        if was_training:
-            model.train()
-        sandbox_input = [
-            (it["prompt"], _strip_thinking_probe(gen or ""), it["test"], it["entry_point"])
-            for gen, _tok, it in generations if "gen_error" not in it
-        ]
-        sandbox_results = hs.run_batch(sandbox_input, max_workers=4) if sandbox_input else []
-        idx = 0
-        for gen, tok, it in generations:
-            if "gen_error" in it:
-                out["items"].append({
-                    "src": it.get("src", ""),
-                    "task_id": it.get("task_id"), "error": it["gen_error"],
-                })
-                continue
-            r = sandbox_results[idx] if idx < len(sandbox_results) else None
-            idx += 1
-            tests_passed = bool(r and r.passed)
-            constraint_ok = False
-            constraint_reason = "tests_failed_skip_constraint"
-            if tests_passed:
-                # Build the same code the sandbox saw to apply AST
-                # constraint check on it.
-                cleaned_gen = _strip_thinking_probe(gen or "")
-                try:
-                    cleaned_gen = hs._strip_code_fences(cleaned_gen)
-                except Exception:
-                    pass
-                # Concatenate prompt + gen so we have the full module
-                # source to AST-parse (same as sandbox).
-                full_src = it["prompt"] + cleaned_gen
-                constraint_ok, constraint_reason = _refactor_check_constraint(
-                    full_src, it,
-                )
-            ok = tests_passed and constraint_ok
-            out["items"].append({
-                "src": it.get("src", ""),
-                "task_id": it.get("task_id"),
-                "entry_point": it.get("entry_point"),
-                "ok": ok,
-                "tests_passed": tests_passed,
-                "constraint_ok": constraint_ok,
-                "constraint_reason": constraint_reason,
-                "gen_tokens": int(tok),
-                "reason": (r.reason if r else "no_result")[:120],
-                "tail": (gen or "")[-160:],
-            })
-            out["n"] += 1
-            out["correct"] += int(ok)
-        out["pass_frac"] = out["correct"] / max(1, out["n"])
-        _bench_finalize_token_stats(out)
-    except Exception as e:
-        out["error"] = str(e)[:200]
-    return out
+    """Run the refactor_bench probe (v29.4 — preserve behavior + style constraint).
+
+    Layered grading: the sandbox runs the canonical pass/fail tests, then the
+    AST style-constraint check (no nested loops / no explicit loop / max
+    lines) gates the final ``ok``. A solution that passes the tests but
+    violates the constraint scores 0; one that violates the constraint
+    AND fails the tests still surfaces ``constraint_reason="tests_failed
+    _skip_constraint"`` so we can tell the two failure modes apart.
+    """
+    def _build_prompt(it):
+        return (
+            "Refactor the function shown. Your refactor must "
+            "preserve behaviour AND meet the style constraint. "
+            "Output only the function (signature + body), no "
+            "extra explanation.\n\n"
+            f"{it['prompt']}"
+        )
+
+    def _post_sandbox(it, gen, r):
+        tests_passed = bool(r and r.passed)
+        constraint_ok = False
+        constraint_reason = "tests_failed_skip_constraint"
+        if tests_passed:
+            cleaned_gen = _strip_thinking_probe(gen or "")
+            try:
+                import humaneval_sandbox as hs  # type: ignore
+                cleaned_gen = hs._strip_code_fences(cleaned_gen)
+            except Exception:
+                pass
+            full_src = it["prompt"] + cleaned_gen
+            constraint_ok, constraint_reason = _refactor_check_constraint(
+                full_src, it,
+            )
+        return tests_passed and constraint_ok, {
+            "tests_passed": tests_passed,
+            "constraint_ok": constraint_ok,
+            "constraint_reason": constraint_reason,
+        }
+
+    return _run_humaneval_sandbox_bench(
+        model, tokenizer, device,
+        sample_key="refactor",
+        max_tokens=BENCH_REFACTOR_MAX_TOKENS,
+        build_prompt=_build_prompt,
+        extra_item_fields=("src",),
+        post_sandbox_hook=_post_sandbox,
+    )
 
 
 def pragmatic_bench_probe(model, tokenizer, device="cuda"):
@@ -6219,9 +7336,7 @@ def pragmatic_bench_probe(model, tokenizer, device="cuda"):
     if not samples or model is None or tokenizer is None:
         return out
     try:
-        was_training = model.training
-        model.eval()
-        with torch.no_grad():
+        with _model_eval_no_grad(model):
             for it in samples:
                 try:
                     prompt_text = it["question"]
@@ -6232,21 +7347,20 @@ def pragmatic_bench_probe(model, tokenizer, device="cuda"):
                     cleaned = _strip_thinking_probe(text or "").strip()
                     ok = _knowledge_v2_grade_one(text or "", it)
                     subtype = it.get("category", "unknown")
-                    sub = out["per_subtype"].setdefault(
-                        subtype, {"n": 0, "correct": 0}
-                    )
-                    sub["n"] += 1
-                    sub["correct"] += int(ok)
-                    # v30.3 — also record under per_src so the saturation
-                    # audit (which iterates composite.per_src) sees this
-                    # axis. ``src`` is the full ``pragmatic/<subtype>``
+                    # v30.3 — record under per_subtype (legacy) AND per_src
+                    # so the saturation audit (which iterates per_src) sees
+                    # this axis. ``src`` is the full ``pragmatic/<subtype>``
                     # tag from the generator.
                     src_key = str(it.get("src", f"pragmatic/{subtype}"))
-                    src = out["per_src"].setdefault(
-                        src_key, {"n": 0, "correct": 0}
-                    )
-                    src["n"] += 1
-                    src["correct"] += int(ok)
+                    for bucket_dict, bucket_key in (
+                        (out["per_subtype"], subtype),
+                        (out["per_src"], src_key),
+                    ):
+                        bucket = bucket_dict.setdefault(
+                            bucket_key, {"n": 0, "correct": 0}
+                        )
+                        bucket["n"] += 1
+                        bucket["correct"] += int(ok)
                     out["items"].append({
                         "src": it.get("src", ""),
                         "category": subtype,
@@ -6259,19 +7373,12 @@ def pragmatic_bench_probe(model, tokenizer, device="cuda"):
                     out["correct"] += int(ok)
                 except Exception as e:
                     out["items"].append({"src": it.get("src", ""), "error": str(e)[:120]})
-        if was_training:
-            model.train()
         out["pass_frac"] = out["correct"] / max(1, out["n"])
-        for sub_name, sub_stats in out["per_subtype"].items():
-            sub_stats["pass_frac"] = (
-                sub_stats["correct"] / sub_stats["n"]
-                if sub_stats["n"] else 0.0
-            )
-        for src_name, src_stats in out["per_src"].items():
-            src_stats["pass_frac"] = (
-                src_stats["correct"] / src_stats["n"]
-                if src_stats["n"] else 0.0
-            )
+        for stats_dict in (out["per_subtype"], out["per_src"]):
+            for stats in stats_dict.values():
+                stats["pass_frac"] = (
+                    stats["correct"] / stats["n"] if stats["n"] else 0.0
+                )
         _bench_finalize_token_stats(out)
     except Exception as e:
         out["error"] = str(e)[:200]
@@ -6594,17 +7701,15 @@ def _bench_generate_sampled(model, tokenizer, prompt: str, max_new_tokens: int,
     are reproducible across validators (deterministic given the same
     (prompt, seed, temperature, top_p)). Everything else matches the
     greedy variant for behavioral parity.
+
+    NOTE: ``enable_thinking`` is overridden by the global
+    ``BENCH_ENABLE_THINKING`` flag (same as ``_bench_generate``) so
+    self-consistency samples reward thinking-mode kings end-to-end.
     """
-    eos_ids = []
-    for tok in ("<|im_end|>", "<|endoftext|>"):
-        tid = tokenizer.convert_tokens_to_ids(tok)
-        if isinstance(tid, int) and tid >= 0:
-            eos_ids.append(tid)
-    if getattr(tokenizer, "eos_token_id", None) is not None:
-        eos_ids.append(int(tokenizer.eos_token_id))
-    eos_ids = list(set(eos_ids)) or None
-    pad_id = getattr(tokenizer, "pad_token_id", None) or (eos_ids[0] if eos_ids else 0)
-    rendered = _render_chat_prompt(tokenizer, prompt, enable_thinking=enable_thinking)
+    eos_ids, pad_id = _eos_pad_ids(tokenizer)
+    rendered = _render_chat_prompt(
+        tokenizer, prompt, enable_thinking=BENCH_ENABLE_THINKING,
+    )
     ids = tokenizer(rendered, return_tensors="pt").input_ids.to(device)
     prev_state = None
     if seed is not None:
@@ -6673,42 +7778,22 @@ def _aime_score_one(pred: str, gold: str) -> int:
 
 
 def aime_bench_probe(model, tokenizer, device="cuda"):
-    out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
-    samples = _BENCH_SAMPLES.get("aime") or []
-    if not samples or model is None or tokenizer is None:
-        return out
-    try:
-        was_training = model.training
-        model.eval()
-        with torch.no_grad():
-            for it in samples:
-                try:
-                    prompt_text = _aime_format_prompt(it["question"])
-                    text, tok = _bench_generate(
-                        model, tokenizer, prompt_text,
-                        BENCH_AIME_MAX_TOKENS, device, enable_thinking=False,
-                    )
-                    pred = _aime_extract_answer(text)
-                    ok = _aime_score_one(pred, it["gold"])
-                    out["items"].append({
-                        "src": it.get("src", ""),
-                        "pred": pred[:20],
-                        "gold": it["gold"][:20],
-                        "ok": bool(ok),
-                        "gen_tokens": int(tok),
-                        "tail": text[-120:],
-                    })
-                    out["n"] += 1
-                    out["correct"] += ok
-                except Exception as e:
-                    out["items"].append({"src": it.get("src", ""), "error": str(e)[:120]})
-        if was_training:
-            model.train()
-        out["pass_frac"] = out["correct"] / max(1, out["n"])
-        _bench_finalize_token_stats(out)
-    except Exception as e:
-        out["error"] = str(e)[:200]
-    return out
+    def _grade(it, text, tok):
+        pred = _aime_extract_answer(text)
+        ok = _aime_score_one(pred, it["gold"])
+        return {
+            "src": it.get("src", ""),
+            "pred": pred[:20],
+            "gold": it["gold"][:20],
+            "ok": bool(ok),
+            "gen_tokens": tok,
+            "tail": text[-120:],
+        }, ok
+    return _run_simple_bench(
+        model, tokenizer, device, "aime", BENCH_AIME_MAX_TOKENS,
+        prompt_fn=lambda it: _aime_format_prompt(it["question"]),
+        grade_fn=_grade,
+    )
 
 
 # ── mbpp_bench (Session 3) ─────────────────────────────────────────────
@@ -6742,87 +7827,41 @@ def _mbpp_build_prompt(item: dict) -> str:
     )
 
 
+def _mbpp_wrap_for_sandbox(test: str, entry_point: str) -> str:
+    """Wrap MBPP ``test`` (raw asserts) in ``def check(candidate):``.
+
+    MBPP solutions don't stub the function signature the way HumanEval
+    does — generations define a fresh function. The sandbox runner
+    expects a top-level ``check(candidate)`` callable, so we indent the
+    raw assert lines into a ``check`` body. The asserts reference the
+    target function by name; Python resolves it from module scope (no
+    rebinding to ``candidate`` required).
+    """
+    indented = "\n".join(
+        (f"    {line}" if line.strip() else "")
+        for line in test.splitlines()
+    )
+    return f"def check(candidate):\n{indented}\n    return True\n"
+
+
 def mbpp_bench_probe(model, tokenizer, device="cuda"):
-    out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
-    samples = _BENCH_SAMPLES.get("mbpp") or []
-    if not samples or model is None or tokenizer is None:
-        return out
-    try:
-        import humaneval_sandbox as hs  # type: ignore
-    except ImportError:
-        out["error"] = "humaneval_sandbox not importable on pod"
-        return out
-    try:
-        generations: list[tuple[str, int, dict]] = []
-        was_training = model.training
-        model.eval()
-        with torch.no_grad():
-            for it in samples:
-                try:
-                    prompt_text = _mbpp_build_prompt(it)
-                    gen, tok = _bench_generate(
-                        model, tokenizer, prompt_text,
-                        BENCH_MBPP_MAX_TOKENS, device, enable_thinking=False,
-                    )
-                    generations.append((gen, int(tok), it))
-                except Exception as e:
-                    generations.append(("", 0, {**it, "gen_error": str(e)[:120]}))
-        if was_training:
-            model.train()
-        # MBPP solutions often don't stub the function signature at the
-        # top of the prompt the way HumanEval does (which uses signature
-        # + docstring). To reuse the sandbox runner, we:
-        #   1. Pass an empty prompt (generation defines the function).
-        #   2. Wrap the standalone assert lines in a ``check(candidate)``
-        #      function the sandbox expects. MBPP ``test`` fields are
-        #      either raw assertions (preferred, from ``test_list``) or
-        #      a helper module that still calls the target by name —
-        #      either way, wrapping in ``def check(candidate):`` and
-        #      binding ``candidate`` to the entry_point makes it work.
-        def _wrap_for_sandbox(test: str, entry_point: str) -> str:
-            # The sandbox calls ``check({entry_point})`` after running
-            # the generation. The generation defines the target function
-            # in module scope. Inside ``check``, the test body references
-            # the function by name and Python looks it up in the
-            # enclosing module scope, so no rebinding is needed — we
-            # only need to indent the asserts into the ``check`` body.
-            indented = "\n".join(
-                (f"    {line}" if line.strip() else "")
-                for line in test.splitlines()
-            )
-            return f"def check(candidate):\n{indented}\n    return True\n"
-        sandbox_input = [
-            ("", _strip_thinking_probe(gen or ""),
-             _wrap_for_sandbox(it["test"], it["entry_point"]),
-             it["entry_point"])
-            for gen, _tok, it in generations if "gen_error" not in it
-        ]
-        sandbox_results = hs.run_batch(sandbox_input, max_workers=4) if sandbox_input else []
-        idx = 0
-        for gen, tok, it in generations:
-            if "gen_error" in it:
-                out["items"].append({
-                    "task_id": it.get("task_id"), "error": it["gen_error"],
-                })
-                continue
-            r = sandbox_results[idx] if idx < len(sandbox_results) else None
-            idx += 1
-            ok = bool(r and r.passed)
-            out["items"].append({
-                "task_id": it.get("task_id"),
-                "entry_point": it.get("entry_point"),
-                "ok": ok,
-                "gen_tokens": int(tok),
-                "reason": (r.reason if r else "no_result")[:120],
-                "tail": (gen or "")[-160:],
-            })
-            out["n"] += 1
-            out["correct"] += int(ok)
-        out["pass_frac"] = out["correct"] / max(1, out["n"])
-        _bench_finalize_token_stats(out)
-    except Exception as e:
-        out["error"] = str(e)[:200]
-    return out
+    """Run the MBPP-style code completion probe.
+
+    Differs from ``code_bench`` only in (a) prompt is built by
+    :func:`_mbpp_build_prompt` (adds entry-point name hint), and
+    (b) the sandbox tuple uses an empty prompt + wrapped ``check``
+    helper because MBPP tests are bare asserts, not signature stubs.
+    """
+    return _run_humaneval_sandbox_bench(
+        model, tokenizer, device,
+        sample_key="mbpp", max_tokens=BENCH_MBPP_MAX_TOKENS,
+        build_prompt=_mbpp_build_prompt,
+        build_sandbox_tuple=lambda gen, it: (
+            "", gen,
+            _mbpp_wrap_for_sandbox(it["test"], it["entry_point"]),
+            it["entry_point"],
+        ),
+    )
 
 
 # ── tool_use_bench (Session 3, agentic) ────────────────────────────────
@@ -6910,7 +7949,7 @@ def tool_use_bench_probe(model, tokenizer, device="cuda"):
                     )
                     text1, tok1 = _bench_generate(
                         model, tokenizer, pass1_prompt,
-                        BENCH_TOOL_USE_MAX_TOKENS, device, enable_thinking=False,
+                        BENCH_TOOL_USE_MAX_TOKENS, device, enable_thinking=BENCH_ENABLE_THINKING,
                     )
                     tok_total = int(tok1)
                     m = _TOOL_CALL_RE.search(text1)
@@ -6937,7 +7976,7 @@ def tool_use_bench_probe(model, tokenizer, device="cuda"):
                         )
                         text2, tok2 = _bench_generate(
                             model, tokenizer, pass2_prompt,
-                            BENCH_TOOL_USE_MAX_TOKENS, device, enable_thinking=False,
+                            BENCH_TOOL_USE_MAX_TOKENS, device, enable_thinking=BENCH_ENABLE_THINKING,
                         )
                         tok_total += int(tok2)
                         combined_text = (
@@ -7430,13 +8469,6 @@ def _generate_long_context_items(block_seed: int, n_items: int, n_distractors: i
 _PROC_NAMES: tuple = ()
 
 
-def _rot_text(s: str, n: int) -> str:
-    if not s:
-        return s
-    n = n % len(s)
-    return s[n:] + s[:n]
-
-
 # ── v27 (Session 3.20) — fully-procedural skill probes ─────────────────────
 #
 # Pre-v27 the bench battery sampled from public HuggingFace datasets
@@ -7479,20 +8511,6 @@ def _rot_text(s: str, n: int) -> str:
 # ``block_seed`` and nothing else.
 
 import math as _v27_math
-
-
-def _v27_int_to_words(n: int) -> str:
-    """Tiny number-words helper for word-problem prompts."""
-    units = ["zero","one","two","three","four","five","six","seven","eight",
-             "nine","ten","eleven","twelve","thirteen","fourteen","fifteen",
-             "sixteen","seventeen","eighteen","nineteen"]
-    tens = ["","","twenty","thirty","forty","fifty","sixty","seventy","eighty","ninety"]
-    if n < 20:
-        return units[n]
-    if n < 100:
-        t, u = divmod(n, 10)
-        return tens[t] + ("-" + units[u] if u else "")
-    return str(n)
 
 
 def _generate_math_items(block_seed, n_items: int) -> list[dict]:
@@ -7600,83 +8618,160 @@ def _generate_math_items(block_seed, n_items: int) -> list[dict]:
     # scenario regardless of whether the shop is called "bakery" or
     # "Drenshire") so the procedural form is grading-equivalent to
     # the legacy lists.
+    # 2026-05-01 (v30.4 patch v4): real-vocabulary shop/item pools.
+    # Anti-memorisation is preserved by the procedural numeric params
+    # (start_money, prices, counts) which fully determine the gold
+    # answer; the surface names of shops and items are decorative
+    # and do not change what the model is asked to compute. Real
+    # vocabulary makes the prompts read like gsm8k items, which is
+    # the whole point of the v29 narrative rebalance.
+    _MATH_SHOPS = (
+        "bakery", "grocery store", "corner shop", "deli", "farmers' market",
+        "supermarket", "general store", "produce stand", "hardware store",
+        "stationery shop", "toy store", "bookstore", "candy shop",
+        "bike shop", "pet store", "florist", "café", "convenience store",
+        "thrift shop", "music store", "art supply store", "garden center",
+    )
+    _MATH_ITEMS = (
+        ("apple", "apples"), ("banana", "bananas"), ("orange", "oranges"),
+        ("muffin", "muffins"), ("cookie", "cookies"), ("loaf", "loaves"),
+        ("bagel", "bagels"), ("notebook", "notebooks"), ("pencil", "pencils"),
+        ("pen", "pens"), ("eraser", "erasers"), ("ruler", "rulers"),
+        ("balloon", "balloons"), ("ticket", "tickets"), ("toy car", "toy cars"),
+        ("postcard", "postcards"), ("stamp", "stamps"), ("comic book", "comic books"),
+        ("magazine", "magazines"), ("candle", "candles"), ("cupcake", "cupcakes"),
+        ("donut", "donuts"), ("scone", "scones"), ("tart", "tarts"),
+        ("paint brush", "paint brushes"), ("sketchpad", "sketchpads"),
+        ("water bottle", "water bottles"), ("backpack", "backpacks"),
+        ("tennis ball", "tennis balls"), ("badge", "badges"),
+        ("birthday card", "birthday cards"), ("postcard book", "postcard books"),
+    )
+
     def _synth_shop(rr):
-        # A procedural common-noun shop label.
-        return _synthetic_word(rr, 2) + rr.choice(["shop", "stand", "stall", "house"])
+        return rr.choice(_MATH_SHOPS)
+
     def _synth_item(rr):
-        # A procedural plural noun item label.
-        word = _synthetic_word(rr, 2)
-        # Pluralise: append "s" / "es" depending on terminal char.
-        return word + ("es" if word.endswith(("s", "x", "z", "ch", "sh")) else "s")
+        return rr.choice(_MATH_ITEMS)[1]  # plural form
     for i in range(n_items):
         r = random.Random(rng.randint(0, 2**31 - 1))
         kind = kinds[i % len(kinds)]
         question = ""
         gold = ""
         if kind == "shopping_budget":
-            name = _synthetic_name(r)
-            friend = _synthetic_name(r)
-            start_money = r.choice([40, 50, 60, 80, 100, 120])
+            # 2026-05-02 (v30.5): hardened. Was 4 ops (mul, mul, add, sub).
+            # Now 6-7 ops by adding (a) a third item type, (b) a percent
+            # discount on one item, (c) sales tax on the subtotal, (d) a
+            # tip the friend covers (so the model must NOT subtract it
+            # from the protagonist's wallet — adversarial inference).
+            name = _realistic_name(r)
+            friend = _realistic_name(r)
+            start_money = r.choice([80, 100, 120, 150, 200, 250])
             n_items_a = r.randint(3, 8)
             price_a = r.choice([2, 3, 4, 5, 6, 7, 8])
             n_items_b = r.randint(2, 6)
             price_b = r.choice([3, 4, 5, 6, 8, 9, 10])
-            distractor = r.choice([7, 11, 13, 14])  # noise: friend's age etc.
+            n_items_c = r.randint(2, 5)
+            price_c = r.choice([4, 6, 8, 10, 12])
+            discount_pct = r.choice([10, 20, 25])  # applies to item_b only
+            tax_pct = r.choice([5, 8, 10])
+            tip_friend_covers = r.randint(3, 9)  # adversarial distractor
+            distractor = r.choice([7, 11, 13, 14])  # friend's age etc.
             shop = _synth_shop(r)
             item_a = _synth_item(r)
             item_b = _synth_item(r)
-            spent = n_items_a * price_a + n_items_b * price_b
+            item_c = _synth_item(r)
+            cost_a = n_items_a * price_a
+            cost_b_pre = n_items_b * price_b
+            cost_b_disc = cost_b_pre - cost_b_pre * discount_pct // 100
+            cost_c = n_items_c * price_c
+            subtotal = cost_a + cost_b_disc + cost_c
+            tax = subtotal * tax_pct // 100
+            spent = subtotal + tax  # tip is paid by friend (adversarial)
             gold_n = start_money - spent
             question = (
                 f"{name} goes to the {shop} with ${start_money}. "
                 f"Their friend {friend}, who is {distractor} years old, "
-                f"comes along but doesn't buy anything. "
-                f"{name} buys {n_items_a} {item_a} at ${price_a} each "
-                f"and {n_items_b} {item_b} at ${price_b} each. "
+                f"comes along. {name} buys {n_items_a} {item_a} at "
+                f"${price_a} each, {n_items_b} {item_b} at ${price_b} each "
+                f"(today the {item_b} are {discount_pct}% off the listed "
+                f"price), and {n_items_c} {item_c} at ${price_c} each. "
+                f"There is a {tax_pct}% sales tax on the discounted "
+                f"subtotal. {friend} also leaves a ${tip_friend_covers} "
+                f"tip from their own wallet (so {name} doesn't pay it). "
                 f"How many dollars does {name} have left after the visit?"
             )
             gold = str(gold_n)
         elif kind == "recipe_scale":
-            name = _synthetic_name(r)
+            # Hardened: was 3 ops. Now 6 ops with multi-ingredient ratios,
+            # a unit conversion (cups → ounces), and a partial-batch
+            # rounding adversary.
+            name = _realistic_name(r)
             base_servings = r.choice([4, 6, 8, 12])
-            target_servings = base_servings * r.choice([2, 3, 4])
+            target_servings = base_servings * r.choice([3, 4, 5])
             cups_per_base = r.choice([2, 3, 4, 5])
-            extra_topping = r.randint(2, 8)
-            distractor = r.choice([45, 60, 90])  # oven temp / time noise
-            cups_total = (target_servings // base_servings) * cups_per_base + extra_topping
-            gold_n = cups_total
+            sugar_per_base = r.choice([1, 2, 3])  # extra ingredient
+            butter_per_base = r.choice([2, 3, 4])
+            extra_topping_cups = r.randint(2, 8)
+            ounces_per_cup = 8  # unit conversion
+            distractor_temp = r.choice([45, 60, 90])
+            scale = target_servings // base_servings
+            cups_flour = scale * cups_per_base + extra_topping_cups
+            cups_sugar = scale * sugar_per_base
+            cups_butter = scale * butter_per_base
+            total_cups = cups_flour + cups_sugar + cups_butter
+            # Final answer in ounces
+            gold_n = total_cups * ounces_per_cup
             recipe = r.choice(["banana bread", "pancakes", "cornbread", "biscuits"])
             question = (
                 f"A {recipe} recipe makes {base_servings} servings and uses "
-                f"{cups_per_base} cups of flour. {name} wants to make "
-                f"{target_servings} servings for a school bake sale. "
-                f"They also need to add {extra_topping} extra cups of flour "
-                f"for a dusting on top. The oven is preheated to "
-                f"{distractor*5} degrees, but that doesn't change the recipe. "
-                f"How many total cups of flour does {name} need?"
+                f"{cups_per_base} cups of flour, {sugar_per_base} cups of "
+                f"sugar, and {butter_per_base} cups of butter. {name} wants "
+                f"to make {target_servings} servings for a school bake sale. "
+                f"They also need to add {extra_topping_cups} extra cups of "
+                f"flour for a dusting on top. The oven is preheated to "
+                f"{distractor_temp*5} degrees (this doesn't change the "
+                f"recipe). The store sells these ingredients by the ounce, "
+                f"and 1 cup equals {ounces_per_cup} ounces. How many TOTAL "
+                f"OUNCES of all three ingredients combined does {name} "
+                f"need?"
             )
             gold = str(gold_n)
         elif kind == "travel_distance":
-            name = _synthetic_name(r)
+            # Hardened: was 4 ops. Now 7 ops with a 3-leg trip, a fuel
+            # consumption calculation overlaid on it, and a unit-converted
+            # final answer.
+            name = _realistic_name(r)
             leg_a_speed = r.choice([40, 50, 60, 70])
             leg_a_hours = r.randint(2, 5)
-            stop_distance = r.randint(15, 40)
+            stop_a_distance = r.randint(15, 40)
             leg_b_speed = r.choice([45, 55, 65, 75])
             leg_b_hours = r.randint(2, 4)
-            distractor = r.choice([8, 12, 24])  # tank size, irrelevant
-            total = leg_a_speed * leg_a_hours + stop_distance + leg_b_speed * leg_b_hours
-            gold_n = total
+            stop_b_distance = r.randint(20, 50)
+            leg_c_speed = r.choice([50, 60, 70, 80])
+            leg_c_hours = r.randint(1, 4)
+            mpg = r.choice([20, 24, 28, 32])
+            tank_size = r.choice([10, 12, 15, 18])  # distractor
+            leg_a_dist = leg_a_speed * leg_a_hours
+            leg_b_dist = leg_b_speed * leg_b_hours
+            leg_c_dist = leg_c_speed * leg_c_hours
+            total_miles = leg_a_dist + stop_a_distance + leg_b_dist + stop_b_distance + leg_c_dist
+            # Final answer in gallons of fuel used (forces unit conversion)
+            gold_n = total_miles // mpg
             question = (
-                f"{name} drives east on the highway at {leg_a_speed} mph for "
-                f"{leg_a_hours} hours. They stop at a rest area, then drive "
-                f"another {stop_distance} miles north to pick up a friend. "
-                f"From there, they continue at {leg_b_speed} mph for "
-                f"{leg_b_hours} hours. The car holds {distractor} gallons of "
-                f"fuel. How many miles total has {name} driven?"
+                f"{name} drives east on the highway at {leg_a_speed} mph "
+                f"for {leg_a_hours} hours, stops at a rest area, then "
+                f"drives another {stop_a_distance} miles north to pick up "
+                f"a friend. From there they continue at {leg_b_speed} mph "
+                f"for {leg_b_hours} hours, take a second short detour of "
+                f"{stop_b_distance} miles east, then finish at {leg_c_speed} "
+                f"mph for {leg_c_hours} hours. The car gets {mpg} miles per "
+                f"gallon and the tank holds {tank_size} gallons. How many "
+                f"gallons of fuel did {name} use on the entire trip "
+                f"(rounded down to a whole gallon)?"
             )
             gold = str(gold_n)
         elif kind == "school_classroom":
-            teacher = _synthetic_name(r)
+            teacher = _realistic_name(r)
             n_classes = r.randint(3, 6)
             students_per_class = r.choice([18, 22, 24, 28, 30])
             absent_per_class = r.randint(1, 4)
@@ -7696,168 +8791,294 @@ def _generate_math_items(block_seed, n_items: int) -> list[dict]:
             )
             gold = str(gold_n)
         elif kind == "garden_orchard":
-            farmer = _synthetic_name(r)
+            # Hardened: was 4 ops. Now 7 ops with 3 spoilage stages
+            # (frost, pests, transport) and a per-tree harvest variance.
+            farmer = _realistic_name(r)
             n_rows = r.randint(4, 9)
             trees_per_row = r.randint(5, 12)
             apples_per_tree = r.choice([20, 25, 30, 40, 50])
-            spoiled_pct = r.choice([10, 20, 25])  # we use raw count: apples * pct/100
+            frost_pct = r.choice([10, 15, 20])
+            pest_pct = r.choice([5, 10, 15])  # second loss stage
             saved_for_market = r.randint(50, 200)
+            crates_capacity = r.choice([20, 25, 30])  # for transport
+            transport_loss_per_crate = r.randint(1, 4)
             apples_total = n_rows * trees_per_row * apples_per_tree
-            spoiled = apples_total * spoiled_pct // 100
-            gold_n = apples_total - spoiled - saved_for_market
+            after_frost = apples_total - apples_total * frost_pct // 100
+            after_pest = after_frost - after_frost * pest_pct // 100
+            after_market = after_pest - saved_for_market
+            n_crates = max(1, after_market // crates_capacity)
+            transport_loss = n_crates * transport_loss_per_crate
+            gold_n = after_market - transport_loss
             question = (
                 f"{farmer} runs an orchard with {n_rows} rows of apple trees. "
                 f"Each row has {trees_per_row} trees, and each tree produces "
-                f"{apples_per_tree} apples this season. {spoiled_pct}% of the "
-                f"apples are spoiled by frost, and {farmer} saves "
-                f"{saved_for_market} apples for the farmer's market next "
-                f"weekend. How many apples are left for {farmer} to sell to "
-                f"the local grocer?"
+                f"{apples_per_tree} apples this season. {frost_pct}% of all "
+                f"apples are lost to frost. After the frost, an additional "
+                f"{pest_pct}% of the SURVIVING apples are spoiled by pests. "
+                f"{farmer} saves {saved_for_market} apples for the farmer's "
+                f"market. The remaining apples are packed into crates that "
+                f"hold {crates_capacity} apples each, and during transport "
+                f"to the grocer, {transport_loss_per_crate} apples are "
+                f"crushed in each filled crate (any partial final crate has "
+                f"no transport loss). How many apples reach the grocer "
+                f"intact?"
             )
             gold = str(gold_n)
         elif kind == "bakery_orders":
-            baker = _synthetic_name(r)
-            n_days = r.randint(3, 6)
-            loaves_per_day = r.choice([24, 30, 36, 48, 60])
+            # Hardened: was 4 ops. Now 6-7 ops with carryover stock,
+            # daily wholesale variation, and a price-per-loaf revenue
+            # calculation as the final answer.
+            baker = _realistic_name(r)
+            starting_stock = r.randint(20, 60)
+            n_days = r.randint(4, 7)
+            loaves_per_day = r.choice([30, 36, 48, 60, 72])
             wholesale_per_day = r.randint(8, 18)
-            walkin_total = r.randint(10, 35)
-            distractor = r.choice([5, 6, 7])  # number of staff
+            walkin_per_day = r.randint(10, 25)
+            staff_distractor = r.choice([5, 6, 7])
+            price_per_loaf = r.choice([4, 5, 6, 8])
+            wholesale_discount_pct = r.choice([20, 25, 30])
+            staff_count = staff_distractor
             produced = n_days * loaves_per_day
-            sold = n_days * wholesale_per_day + walkin_total
-            gold_n = produced - sold
+            wholesale_sold = n_days * wholesale_per_day
+            walkin_sold = n_days * walkin_per_day
+            wholesale_revenue = wholesale_sold * price_per_loaf * (100 - wholesale_discount_pct) // 100
+            walkin_revenue = walkin_sold * price_per_loaf
+            gold_n = wholesale_revenue + walkin_revenue
             question = (
-                f"Baker {baker} runs a small bakery with {distractor} staff. "
-                f"They bake {loaves_per_day} loaves of sourdough every day "
-                f"for {n_days} days straight. Each day they sell "
-                f"{wholesale_per_day} loaves to a wholesale partner, and over "
-                f"the {n_days} days they sell {walkin_total} loaves total to "
-                f"walk-in customers. How many loaves are left in storage at "
-                f"the end of the period?"
+                f"Baker {baker} runs a small bakery with {staff_count} "
+                f"staff and {starting_stock} loaves already in storage at "
+                f"the start of the week. They bake {loaves_per_day} loaves "
+                f"of sourdough every day for {n_days} days. Each day they "
+                f"sell {wholesale_per_day} loaves to a wholesale partner "
+                f"(wholesale price is {wholesale_discount_pct}% LESS than "
+                f"the retail price of ${price_per_loaf} per loaf) and "
+                f"{walkin_per_day} loaves to walk-in customers (at the full "
+                f"retail price). Production always meets demand from new "
+                f"baking, so the starting stock is irrelevant to revenue. "
+                f"How many dollars in TOTAL REVENUE did the bakery earn "
+                f"over the {n_days} days?"
             )
             gold = str(gold_n)
         elif kind == "library_books":
-            librarian = _synthetic_name(r)
-            n_borrowers = r.randint(8, 20)
+            # Hardened: was 1 op. Now 5+ ops with multiple fee tiers and
+            # a replacement-cost calculation.
+            librarian = _realistic_name(r)
+            n_borrowers = r.randint(10, 25)
             books_per_borrower = r.randint(2, 5)
-            late_returns = r.randint(3, 12)
-            fine_per_late = r.choice([2, 3, 5])
-            replacements_bought = r.randint(5, 15)
-            distractor = r.choice([12, 15, 18])  # opening hour noise
-            late_revenue = late_returns * fine_per_late
-            books_borrowed = n_borrowers * books_per_borrower
-            # Net books currently out: borrowed minus all that were returned (some late, some on time)
-            # simpler: how many fines collected = late_returns * fine_per_late
-            gold_n = late_revenue
+            late_returns = r.randint(5, 20)
+            fine_per_day = r.choice([1, 2])  # daily late fine
+            avg_days_late = r.randint(3, 10)
+            lost_books = r.randint(2, 8)
+            replacement_cost = r.choice([15, 18, 22, 25])
+            books_donated = r.randint(8, 20)
+            grant_received = r.choice([100, 150, 200])
+            distractor = r.choice([12, 15, 18])  # opening hour
+            late_fines = late_returns * fine_per_day * avg_days_late
+            replacement_revenue = lost_books * replacement_cost
+            net_revenue = late_fines + replacement_revenue + grant_received
+            # Final answer: net revenue (in dollars).
+            gold_n = net_revenue
             question = (
-                f"Librarian {librarian} runs a reading club. {n_borrowers} "
-                f"members each borrowed {books_per_borrower} books for the "
-                f"month. The library opens at {distractor}:00 each day. By "
-                f"the deadline, {late_returns} books were returned late. The "
-                f"library charges ${fine_per_late} per late book. They also "
-                f"used the fines to buy {replacements_bought} replacement "
-                f"books later. How many dollars in late fees did the library "
-                f"collect?"
+                f"Librarian {librarian} runs a reading club with "
+                f"{n_borrowers} members; each borrowed "
+                f"{books_per_borrower} books this month. The library opens "
+                f"at {distractor}:00 each day. By the deadline, "
+                f"{late_returns} books were returned late, on average "
+                f"{avg_days_late} days late, at a fine of ${fine_per_day} "
+                f"per book per day. {lost_books} books were never returned "
+                f"and the library charges the borrower ${replacement_cost} "
+                f"per lost book to replace it. The library also received a "
+                f"${grant_received} grant from the city this month and was "
+                f"donated {books_donated} new books from a patron (the "
+                f"donations are not income). What is the library's total "
+                f"revenue (in dollars) for the month?"
             )
             gold = str(gold_n)
         elif kind == "fundraiser":
-            organizer = _synthetic_name(r)
+            # Hardened: was 4 ops. Now 6 ops with three donor tiers, a
+            # raffle revenue, and an admin fee deducted from the total.
+            organizer = _realistic_name(r)
+            bronze_donors = r.randint(10, 30)
+            bronze_amount = r.choice([5, 10])
             silver_donors = r.randint(8, 25)
-            silver_amount = r.choice([10, 15, 20, 25])
+            silver_amount = r.choice([20, 25, 30])
             gold_donors = r.randint(3, 9)
-            gold_amount = r.choice([50, 75, 100, 150])
-            corporate_match = r.choice([100, 200, 300, 500])
-            distractor = r.choice([3, 5, 7])  # event hour noise
+            gold_amount = r.choice([75, 100, 150])
+            corporate_match_pct = r.choice([10, 25, 50])  # of all donations
+            raffle_tickets_sold = r.randint(40, 120)
+            raffle_price = r.choice([3, 5, 7])
+            admin_fee_pct = r.choice([5, 8, 10])
+            event_hour_distractor = r.choice([3, 5, 7])
+            bronze_total = bronze_donors * bronze_amount
             silver_total = silver_donors * silver_amount
             gold_total = gold_donors * gold_amount
-            gold_n = silver_total + gold_total + corporate_match
+            donations = bronze_total + silver_total + gold_total
+            corporate = donations * corporate_match_pct // 100
+            raffle = raffle_tickets_sold * raffle_price
+            gross = donations + corporate + raffle
+            admin_fee = gross * admin_fee_pct // 100
+            gold_n = gross - admin_fee
             question = (
-                f"{organizer} ran a {distractor}-hour charity fundraiser. "
-                f"{silver_donors} silver-tier donors gave ${silver_amount} "
-                f"each. {gold_donors} gold-tier donors gave ${gold_amount} "
-                f"each. A local company contributed an additional "
-                f"${corporate_match} as a flat corporate match. How many "
-                f"dollars did the fundraiser raise in total?"
+                f"{organizer} ran a {event_hour_distractor}-hour charity "
+                f"fundraiser. {bronze_donors} bronze-tier donors gave "
+                f"${bronze_amount} each, {silver_donors} silver-tier gave "
+                f"${silver_amount} each, and {gold_donors} gold-tier gave "
+                f"${gold_amount} each. A local company contributed a "
+                f"corporate match equal to {corporate_match_pct}% of total "
+                f"individual donations. The fundraiser also sold "
+                f"{raffle_tickets_sold} raffle tickets at ${raffle_price} "
+                f"each. The venue charges an {admin_fee_pct}% administrative "
+                f"fee on the GROSS amount raised (donations + match + "
+                f"raffle). How many dollars are NET-raised after the admin "
+                f"fee?"
             )
             gold = str(gold_n)
         elif kind == "trip_planning":
-            traveler = _synthetic_name(r)
-            nights = r.randint(3, 8)
-            lodging_per_night = r.choice([60, 80, 90, 120, 150])
-            meals_per_day = r.choice([20, 30, 40])
-            transport = r.choice([80, 120, 150, 200])
-            distractor = r.choice([2, 4, 6])  # number of travelers? noise
-            lodging = nights * lodging_per_night
-            meals = nights * meals_per_day
-            gold_n = lodging + meals + transport
+            # Hardened: was 3 ops. Now 6 ops with per-day meal variation,
+            # transit cost split across travelers, and a tax on lodging.
+            traveler = _realistic_name(r)
+            nights = r.randint(4, 9)
+            lodging_per_night = r.choice([80, 100, 120, 150, 200])
+            lodging_tax_pct = r.choice([8, 10, 12, 15])
+            breakfast_per_day = r.choice([10, 15, 20])
+            dinner_per_day = r.choice([25, 30, 40, 50])
+            transport_total = r.choice([200, 300, 400, 500])
+            companions = r.randint(2, 4)  # transport split among
+            ticket_distractor = r.choice([15, 25, 35])  # noise
+            lodging_pre_tax = nights * lodging_per_night
+            lodging_tax = lodging_pre_tax * lodging_tax_pct // 100
+            meals = nights * (breakfast_per_day + dinner_per_day)
+            transport_per_person = transport_total // (companions + 1)
+            gold_n = lodging_pre_tax + lodging_tax + meals + transport_per_person
             question = (
                 f"{traveler} is planning a {nights}-night trip with "
-                f"{distractor} other people, but they're each paying their "
-                f"own way. {traveler}'s lodging costs ${lodging_per_night} "
-                f"per night, meals cost ${meals_per_day} per day, and "
-                f"round-trip transport costs ${transport}. How many dollars "
-                f"will {traveler}'s share of the trip cost?"
+                f"{companions} other people. {traveler}'s lodging costs "
+                f"${lodging_per_night} per night plus a {lodging_tax_pct}% "
+                f"hotel tax (the tax applies only to {traveler}'s lodging, "
+                f"not anyone else's). Meals cost ${breakfast_per_day} per "
+                f"day for breakfast and ${dinner_per_day} per day for "
+                f"dinner (lunch is provided by the venue). Round-trip "
+                f"transport for the entire group costs ${transport_total}, "
+                f"split evenly among all {companions + 1} travelers (each "
+                f"pays an equal share, rounded down to the dollar). Tickets "
+                f"to a museum cost ${ticket_distractor} but are paid for "
+                f"separately. How many dollars total will {traveler}'s "
+                f"share of lodging + meals + transport cost?"
             )
             gold = str(gold_n)
         elif kind == "pets_animals":
-            owner = _synthetic_name(r)
-            n_chickens = r.randint(8, 25)
+            # Hardened: was 3 ops. Now 6 ops with a feed-cost calculation,
+            # weekly egg sale revenue, and a per-chicken loss to predators.
+            owner = _realistic_name(r)
+            n_chickens_start = r.randint(15, 35)
             eggs_per_week_per_chicken = r.choice([4, 5, 6, 7])
-            n_weeks = r.randint(2, 6)
-            eggs_for_breakfast = r.randint(10, 25)
-            eggs_donated = r.randint(5, 18)
-            distractor = r.choice([12, 15, 18])  # coop dimension noise
-            total_eggs = n_chickens * eggs_per_week_per_chicken * n_weeks
-            gold_n = total_eggs - eggs_for_breakfast - eggs_donated
+            n_weeks = r.randint(3, 8)
+            chickens_lost_to_predator = r.randint(1, 4)  # mid-period
+            eggs_for_breakfast_per_week = r.randint(8, 18)
+            eggs_donated_total = r.randint(15, 35)
+            price_per_dozen = r.choice([3, 4, 5, 6])
+            feed_cost_per_week = r.choice([8, 12, 15])
+            coop_dim_distractor = r.choice([12, 15, 18])
+            chickens_avg = (n_chickens_start * 2 - chickens_lost_to_predator) // 2
+            total_eggs = chickens_avg * eggs_per_week_per_chicken * n_weeks
+            eggs_for_breakfast = eggs_for_breakfast_per_week * n_weeks
+            eggs_for_sale = total_eggs - eggs_for_breakfast - eggs_donated_total
+            dozens_for_sale = eggs_for_sale // 12
+            revenue = dozens_for_sale * price_per_dozen
+            feed_cost_total = feed_cost_per_week * n_weeks
+            gold_n = revenue - feed_cost_total
             question = (
-                f"{owner} keeps {n_chickens} chickens in a "
-                f"{distractor}-meter coop. Each chicken lays "
-                f"{eggs_per_week_per_chicken} eggs per week. Over "
-                f"{n_weeks} weeks, the family ate {eggs_for_breakfast} eggs "
-                f"for breakfast and donated {eggs_donated} eggs to a "
-                f"neighbor. How many eggs are left at the end of the "
-                f"{n_weeks} weeks?"
+                f"{owner} keeps {n_chickens_start} chickens in a "
+                f"{coop_dim_distractor}-meter coop. Each chicken lays "
+                f"{eggs_per_week_per_chicken} eggs per week. Halfway "
+                f"through the period, {chickens_lost_to_predator} chickens "
+                f"were lost to a predator (assume the average flock size "
+                f"over the period was the average of the starting and "
+                f"ending counts, and use that to compute total egg "
+                f"production). Over the full {n_weeks} weeks, the family "
+                f"ate {eggs_for_breakfast_per_week} eggs per week for "
+                f"breakfast and donated {eggs_donated_total} eggs total to "
+                f"a neighbor. The remaining eggs are sold by the dozen at "
+                f"${price_per_dozen} per dozen (any partial dozen is not "
+                f"sold). Feed costs ${feed_cost_per_week} per week. How "
+                f"many dollars in NET PROFIT (sales minus feed cost) does "
+                f"{owner} earn over the {n_weeks} weeks?"
             )
             gold = str(gold_n)
         elif kind == "sports_tournament":
-            captain = _synthetic_name(r)
-            n_games = r.randint(8, 20)
-            n_wins = r.randint(3, n_games - 2)
-            n_losses = n_games - n_wins
-            points_per_win = r.choice([2, 3])
-            points_per_loss = r.choice([0, 1])
-            bonus_pts = r.randint(2, 8)
-            distractor = r.choice([5, 6, 7])  # players on field noise
-            gold_n = n_wins * points_per_win + n_losses * points_per_loss + bonus_pts
+            # Hardened: was 3 ops. Now 6 ops with knockout-stage bonus,
+            # disciplinary penalty, and average-points-per-game.
+            captain = _realistic_name(r)
+            n_games = r.randint(12, 24)
+            n_wins = r.randint(5, n_games - 3)
+            n_draws = r.randint(1, max(1, (n_games - n_wins) // 2))
+            n_losses = n_games - n_wins - n_draws
+            points_per_win = r.choice([3, 4])
+            points_per_draw = r.choice([1, 2])
+            points_per_loss = 0
+            bonus_per_clean_sheet = r.choice([1, 2])
+            n_clean_sheets = r.randint(2, max(2, n_wins - 1))
+            yellow_cards = r.randint(2, 8)
+            penalty_per_yellow = r.choice([1, 2])
+            playoff_qualified = r.random() < 0.5
+            playoff_bonus = r.choice([5, 8, 10]) if playoff_qualified else 0
+            distractor_players = r.choice([5, 6, 7])
+            base_points = n_wins * points_per_win + n_draws * points_per_draw + n_losses * points_per_loss
+            clean_sheet_bonus = n_clean_sheets * bonus_per_clean_sheet
+            penalty = yellow_cards * penalty_per_yellow
+            gold_n = base_points + clean_sheet_bonus - penalty + playoff_bonus
             sport = r.choice(["soccer", "hockey", "basketball", "rugby"])
             question = (
                 f"Captain {captain}'s {sport} team played {n_games} games "
-                f"with {distractor} players on the field at any time. They "
-                f"won {n_wins} games and lost {n_losses} games. Each win is "
-                f"worth {points_per_win} league points, each loss is worth "
-                f"{points_per_loss} consolation points, and the team got an "
-                f"extra {bonus_pts} bonus points for fair play. How many "
-                f"total league points did {captain}'s team end the season "
+                f"with {distractor_players} players on the field. They "
+                f"won {n_wins}, drew {n_draws}, and lost {n_losses}. A win "
+                f"is worth {points_per_win} league points, a draw worth "
+                f"{points_per_draw}, a loss worth {points_per_loss}. The "
+                f"team also kept a clean sheet (no goals conceded) in "
+                f"{n_clean_sheets} games and earns "
+                f"{bonus_per_clean_sheet} extra point per clean sheet. "
+                f"They received {yellow_cards} yellow cards across the "
+                f"season; each yellow card deducts "
+                f"{penalty_per_yellow} point. "
+                f"{'They qualified for the playoffs and received a flat ' + str(playoff_bonus) + '-point bonus.' if playoff_qualified else 'They did NOT qualify for the playoffs (no playoff bonus).'} "
+                f"How many total league points did the team end the season "
                 f"with?"
             )
             gold = str(gold_n)
         elif kind == "construction":
-            contractor = _synthetic_name(r)
-            n_walls = r.randint(3, 8)
-            bricks_per_wall = r.choice([80, 100, 120, 150, 200])
-            mortar_per_wall = r.choice([3, 4, 5, 6])  # bags
-            broken_bricks = r.randint(5, 25)
-            extra_safety = r.choice([20, 30, 50])
-            distractor = r.choice([8, 10, 12])  # ladder height noise
-            bricks_total = n_walls * bricks_per_wall + extra_safety
-            gold_n = bricks_total - broken_bricks
+            # Hardened: was 3 ops. Now 6 ops with mortar bags, 2-stage
+            # waste (delivery + cutting), and tool rental cost split
+            # across phases.
+            contractor = _realistic_name(r)
+            n_walls = r.randint(4, 10)
+            bricks_per_wall = r.choice([100, 120, 150, 180, 220])
+            mortar_per_wall = r.choice([3, 4, 5, 6])
+            mortar_bag_size = r.choice([10, 12, 15])  # walls per bag
+            broken_in_delivery = r.randint(8, 30)
+            cut_waste_per_wall = r.randint(2, 6)
+            extra_safety = r.choice([30, 50, 75])
+            ladder_distractor = r.choice([8, 10, 12])
+            bricks_needed = n_walls * bricks_per_wall + extra_safety
+            cut_waste_total = n_walls * cut_waste_per_wall
+            bricks_to_order = bricks_needed + broken_in_delivery + cut_waste_total
+            n_mortar_bags = (n_walls + mortar_bag_size - 1) // mortar_bag_size
+            # Final answer: total bricks to order
+            gold_n = bricks_to_order
             question = (
                 f"Contractor {contractor} is building {n_walls} brick walls "
-                f"using a {distractor}-foot ladder. Each wall needs "
-                f"{bricks_per_wall} bricks. {contractor} also orders "
-                f"{extra_safety} extra bricks as a safety margin. During "
-                f"delivery, {broken_bricks} bricks arrive broken and have "
-                f"to be discarded. How many usable bricks does {contractor} "
-                f"have to build the walls?"
+                f"using a {ladder_distractor}-foot ladder (irrelevant to "
+                f"the order). Each wall needs {bricks_per_wall} bricks "
+                f"to complete. The contractor wants to order an extra "
+                f"{extra_safety} bricks as an end-of-job safety margin. "
+                f"Historically, on a delivery this size, "
+                f"{broken_in_delivery} bricks arrive broken and need to be "
+                f"replaced. Cutting bricks to fit at corners always wastes "
+                f"about {cut_waste_per_wall} bricks per wall. (The crew "
+                f"will also need to order mortar — about {mortar_per_wall} "
+                f"bags per wall — but that is a separate purchase.) How "
+                f"many bricks should {contractor} order in TOTAL so that "
+                f"the safety margin still has all {extra_safety} bricks "
+                f"intact after delivery loss and cut waste?"
             )
             gold = str(gold_n)
         elif kind == "modular_linear":
@@ -7964,13 +9185,57 @@ def _generate_math_items(block_seed, n_items: int) -> list[dict]:
             )
             gold = str(gold_n)
         elif kind == "unit_conversion":
-            hours = r.randint(2, 14)
-            mins_per_hour = 60
-            extra_min = r.randint(0, 59)
-            gold_n = hours * mins_per_hour + extra_min
-            question = (
-                f"How many total minutes are in {hours} hours and {extra_min} minutes?"
-            )
+            # 2026-05-01 (v30.4 patch v4): make harder. Was 1 op
+            # (hours*60+min). Now 3 ops by chaining a unit conversion
+            # with a delta-calculation: "In a workout that lasts H
+            # hours M minutes, you sprint for S seconds out of every
+            # minute. How many total minutes do you spend sprinting?"
+            variant = r.choice(["clock", "speed_distance", "currency_change"])
+            if variant == "clock":
+                hours = r.randint(2, 14)
+                extra_min = r.randint(0, 59)
+                seconds_per_min = r.choice([15, 20, 30, 45])
+                # Total seconds spent active.
+                gold_n = (hours * 60 + extra_min) * seconds_per_min
+                actor = _realistic_name(r)
+                question = (
+                    f"{actor} works out for {hours} hours and {extra_min} "
+                    f"minutes total. During every minute, they spend "
+                    f"{seconds_per_min} seconds doing sprint intervals. "
+                    f"How many total seconds does {actor} spend on sprint "
+                    f"intervals?"
+                )
+            elif variant == "speed_distance":
+                speed_kph = r.choice([60, 72, 84, 96])
+                hours = r.randint(2, 5)
+                stop_minutes = r.randint(20, 50)
+                # Total kilometers driven (stops contribute 0 distance).
+                gold_n = speed_kph * hours
+                actor = _realistic_name(r)
+                question = (
+                    f"{actor} drives at a steady speed of {speed_kph} km/h "
+                    f"for exactly {hours} hours. In the middle of the "
+                    f"journey, they take a {stop_minutes}-minute break at a "
+                    f"rest stop (during which the car is parked and not "
+                    f"moving). How many total kilometers has {actor} "
+                    f"driven?"
+                )
+            else:  # currency_change
+                price_pounds = r.randint(8, 25)
+                price_pence = r.choice([0, 25, 50, 75, 99])
+                pence_per_pound = 100
+                paid_pounds = price_pounds + r.randint(2, 12)
+                # Change in pence.
+                amount_owed_pence = price_pounds * pence_per_pound + price_pence
+                paid_pence = paid_pounds * pence_per_pound
+                gold_n = paid_pence - amount_owed_pence
+                actor = _realistic_name(r)
+                question = (
+                    f"{actor} pays £{paid_pounds} for an item priced at "
+                    f"£{price_pounds}.{price_pence:02d}. How many pence in "
+                    f"change does {actor} receive? (1 pound = 100 pence; "
+                    f"give the answer as an integer.)"
+                )
             gold = str(gold_n)
         elif kind == "simultaneous":
             x = r.randint(-9, 12)
@@ -8100,80 +9365,138 @@ def _generate_math_items(block_seed, n_items: int) -> list[dict]:
 
 
 def _generate_aime_items(block_seed, n_items: int) -> list[dict]:
-    """Harder procedural math for the (renamed) ``aime_bench`` axis (v27).
+    """Harder procedural math for the (renamed) ``aime_bench`` axis.
 
-    Drops the public AIME pool entirely; instead generates olympiad-flavoured
-    multi-step problems whose answer is a positive integer 0-999 (matching
-    the AIME convention so existing answer extraction works). Each item
-    requires combining two operations (e.g. solve a quadratic AND apply a
-    modular constraint) so a 4B-class model with brittle reasoning fails
-    at ~70-90% on the reference, while a strong distillation reaches 30-50%.
+    2026-05-02 (v30.5): hardening pass.
+    - Original 5 kinds kept but with deeper params (e.g. exponents 7-19
+      → 13-31; CRT 2-coprime → 3-coprime).
+    - Two new kinds: ``coordinate_geometry`` (lattice / right-triangle
+      enumeration) and ``polynomial_root_sum`` (Vieta-style root sum).
+    - Olympiad problems whose answer is a positive integer 0-999
+      (matching the AIME convention so existing answer extraction
+      works). Each item requires combining 3-4 operations so a
+      4B-class model with brittle reasoning fails at ~70-85 % on the
+      reference, while a strong distillation reaches 25-45 %.
     """
     import random
     from math import gcd
     rng = random.Random((int(block_seed or 0) ^ _BENCH_STREAM["aime"]) & 0xFFFFFFFF)
-    kinds = ["chained_modular", "diophantine", "factor_chain", "lcm_residue", "iterated_digit"]
+    kinds = [
+        "chained_modular", "diophantine", "factor_chain", "lcm_residue",
+        "iterated_digit", "coordinate_geometry", "polynomial_root_sum",
+    ]
     rng.shuffle(kinds)
     out: list[dict] = []
     for i in range(n_items):
         r = random.Random(rng.randint(0, 2**31 - 1))
         kind = kinds[i % len(kinds)]
         if kind == "chained_modular":
-            a = r.randint(2, 9)
-            b = r.randint(2, 9)
-            n = r.randint(7, 19)
-            mod = r.choice([97, 101, 103, 107, 109, 113])
-            val = pow(a, n, mod) * b % mod
+            # Hardened: exponents 7-19 → 13-31, plus a third operation
+            # so the chain is now 3-step (a^n * b + c) mod m.
+            a = r.randint(2, 11)
+            b = r.randint(2, 11)
+            c = r.randint(0, 50)
+            n = r.randint(13, 31)
+            mod = r.choice([97, 101, 103, 107, 109, 113, 127, 131, 137])
+            val = (pow(a, n, mod) * b + c) % mod
             gold = str(val)
             question = (
-                f"Compute the value of (({a}^{n}) * {b}) mod {mod}, where ^ "
-                f"denotes integer exponentiation. The final answer is a "
-                f"non-negative integer less than {mod}."
+                f"Compute the value of (({a}^{n}) * {b} + {c}) mod {mod}, "
+                f"where ^ denotes integer exponentiation. The final answer "
+                f"is a non-negative integer less than {mod}."
             )
         elif kind == "diophantine":
-            x = r.randint(2, 11)
-            y = r.randint(x, 13)
-            s = x + y
-            p = x * y
-            gold = str(x * x + y * y)
+            # Hardened: 2 unknowns → 3 unknowns. Pick x, y, z with
+            # bounded sums + products and ask for x^3 + y^3 + z^3.
+            x = r.randint(2, 9)
+            y = r.randint(x, 11)
+            z = r.randint(y, 13)
+            s = x + y + z
+            p_xy = x * y
+            p_yz = y * z
+            gold = str(x ** 3 + y ** 3 + z ** 3)
             question = (
-                f"Two positive integers x and y satisfy x + y = {s} and "
-                f"x * y = {p}, with 2 <= x <= y. Compute the integer x^2 + y^2."
+                f"Three positive integers x, y, z satisfy x + y + z = {s}, "
+                f"x * y = {p_xy}, and y * z = {p_yz}, with 2 <= x <= y <= z. "
+                f"Compute the integer x^3 + y^3 + z^3."
             )
         elif kind == "factor_chain":
-            primes = [3, 5, 7, 11, 13, 17, 19]
+            # Hardened: 3 primes → 4 primes; ask for ∏(p_i+1) instead of sum.
+            primes = [3, 5, 7, 11, 13, 17, 19, 23]
             r.shuffle(primes)
-            p1, p2, p3 = primes[0], primes[1], primes[2]
-            n_val = p1 * p2 * p3
-            extra = r.randint(0, 50)
-            gold = str(p1 + p2 + p3 + extra)
+            p1, p2, p3, p4 = primes[:4]
+            n_val = p1 * p2 * p3 * p4
+            mod = r.choice([100, 1000])
+            prod_inc = (p1 + 1) * (p2 + 1) * (p3 + 1) * (p4 + 1)
+            gold = str(prod_inc % mod)
             question = (
-                f"The integer {n_val} factors uniquely as a product of three "
-                f"distinct primes. Let s be the sum of those three primes. "
-                f"Compute s + {extra}."
+                f"The integer {n_val} factors uniquely as a product of four "
+                f"distinct primes. Let p_1 < p_2 < p_3 < p_4 be those four "
+                f"primes. Compute (p_1 + 1)(p_2 + 1)(p_3 + 1)(p_4 + 1) "
+                f"mod {mod}."
             )
         elif kind == "lcm_residue":
-            a = r.choice([6, 8, 10, 12, 14, 15])
-            b = r.choice([7, 9, 11, 13, 16])
-            while gcd(a, b) != 1:
-                b = r.choice([7, 9, 11, 13, 16, 17, 19])
-            modulus = a * b
+            # Hardened: CRT with 3 pairwise-coprime moduli (was 2).
+            a_pool = [3, 4, 5, 7, 8, 9, 11, 13]
+            r.shuffle(a_pool)
+            a = a_pool[0]
+            b = next((m for m in a_pool[1:] if gcd(m, a) == 1), 7)
+            c = next((m for m in a_pool[1:] if gcd(m, a) == 1 and gcd(m, b) == 1), 11)
+            modulus = a * b * c
             target = r.randint(2, modulus - 2)
             gold = str(target)
             question = (
-                f"Find the smallest positive integer x with x mod {a} = "
-                f"{target % a} and x mod {b} = {target % b}. The answer is "
-                f"a positive integer less than {modulus}."
+                f"Find the smallest positive integer x with "
+                f"x mod {a} = {target % a}, x mod {b} = {target % b}, "
+                f"and x mod {c} = {target % c}. The answer is a positive "
+                f"integer less than {modulus}."
             )
-        else:  # iterated_digit
+        elif kind == "iterated_digit":
+            # Hardened: 3 iterations → 5 iterations.
             seed_n = r.randint(50, 500)
             cur = seed_n
-            for _ in range(3):
+            for _ in range(5):
                 cur = sum(int(d) for d in str(cur)) * 7 + 3
-            gold = str(cur)
+            mod = 1000
+            gold = str(cur % mod)
             question = (
-                f"Define f(n) = 7 * (sum of digits of n) + 3. Starting at n_0 = "
-                f"{seed_n}, compute n_3 = f(f(f(n_0)))."
+                f"Define f(n) = 7 * (sum of digits of n) + 3. Starting at "
+                f"n_0 = {seed_n}, compute n_5 = f(f(f(f(f(n_0))))) mod 1000."
+            )
+        elif kind == "coordinate_geometry":
+            # Count lattice points (x, y) with 1 <= x <= a, 1 <= y <= b
+            # such that gcd(x, y) = 1. Cleanly procedural; the answer is
+            # the totient-style sum which a model has to actually
+            # enumerate (no closed form for arbitrary a, b).
+            a = r.randint(8, 18)
+            b = r.randint(8, 18)
+            count = 0
+            for x in range(1, a + 1):
+                for y in range(1, b + 1):
+                    if gcd(x, y) == 1:
+                        count += 1
+            gold = str(count)
+            question = (
+                f"Count the number of lattice points (x, y) with "
+                f"1 <= x <= {a} and 1 <= y <= {b} such that gcd(x, y) = 1. "
+                f"The final answer is a positive integer."
+            )
+        else:  # polynomial_root_sum
+            # Vieta's formulas on a procedural cubic: pick three integer
+            # roots, build the cubic, ask for the sum of squares of roots.
+            roots = sorted(r.sample(range(-9, 10), 3))
+            r1, r2, r3 = roots
+            # Coefficients: x^3 - (sum)x^2 + (pair-sum)x - (prod)
+            sum_r = r1 + r2 + r3
+            pair = r1 * r2 + r1 * r3 + r2 * r3
+            prod = r1 * r2 * r3
+            sum_sq = r1 ** 2 + r2 ** 2 + r3 ** 2
+            gold = str(sum_sq)
+            question = (
+                f"The cubic equation x^3 + ({-sum_r})x^2 + ({pair})x + "
+                f"({-prod}) = 0 has three integer roots. Compute the sum "
+                f"of the squares of the three roots (i.e. r_1^2 + r_2^2 + "
+                f"r_3^2). The final answer is a non-negative integer."
             )
         question = question + (
             "\n\nSolve carefully and end with '#### N' where N is the final integer answer."
@@ -8231,19 +9554,34 @@ def _generate_code_items(block_seed, n_items: int) -> list[dict]:
     """
     import random
     rng = random.Random((int(block_seed or 0) ^ _BENCH_STREAM["code"]) & 0xFFFFFFFF)
+    # 2026-05-02 (v30.5): code-bench hardening pass.
+    # ─────────────────────────────────────────────
+    # 1. Hard-tier ratio bumped 70% → 90%. Legacy easy subtypes
+    #    saturated at ≥0.95 across all models (no signal); now they
+    #    take only 10% of the round budget as difficulty floor.
+    # 2. Three new LeetCode-medium subtypes added (all humaneval-distribution):
+    #    - longest_palindromic_substring (DP / center-expand)
+    #    - group_anagrams (hash table + canonicalisation)
+    #    - kth_largest (sorting / quickselect)
+    # 3. Per-subtype: more test inputs, larger arrays (5-15 items vs
+    #    earlier 2-7), explicit edge cases (empty, single, all-equal,
+    #    sorted-ascending, sorted-descending, negative-only).
     hard_kinds = [
         "coin_change_min", "merge_intervals", "rolling_max",
         "nested_paren_groups", "evaluate_postfix", "roman_to_int",
         "binary_search_first", "unique_paths_grid", "longest_no_repeat",
         "validate_brackets", "sliding_window_min", "most_freq_elem",
         "compress_string", "two_sum_pairs",
+        "caesar_cipher", "flatten_nested_list",
+        "closest_pair_sum", "run_length_decode",
+        "longest_palindromic_substring", "group_anagrams", "kth_largest",
     ]
     legacy_kinds = [
         "transform_list", "aggregate_list", "string_predicate",
         "digit_sum", "window_sum", "pair_count", "run_length",
         "string_transform",
     ]
-    n_hard = max(1, (n_items * 70 + 50) // 100)
+    n_hard = max(1, (n_items * 90 + 50) // 100)
     n_legacy = max(0, n_items - n_hard)
     hard_pool = hard_kinds * ((n_hard // len(hard_kinds)) + 1)
     legacy_pool = legacy_kinds * ((n_legacy // len(legacy_kinds)) + 1)
@@ -8990,6 +10328,260 @@ def _generate_code_items(block_seed, n_items: int) -> list[dict]:
             for _ in range(5):
                 xs = [r.randint(0, target) for _ in range(r.randint(0, 7))]
                 test_lines.append(f"    assert candidate({xs!r}) == {ref(xs)!r}")
+        elif kind == "caesar_cipher":
+            shift = r.randint(1, 25)
+            entry_point = "caesar_encrypt"
+
+            def _ref_caesar(s, k=shift):
+                out_chars = []
+                for c in s:
+                    if c.isupper():
+                        out_chars.append(chr((ord(c) - 65 + k) % 26 + 65))
+                    elif c.islower():
+                        out_chars.append(chr((ord(c) - 97 + k) % 26 + 97))
+                    else:
+                        out_chars.append(c)
+                return "".join(out_chars)
+            ref = _ref_caesar
+            ex_out = _ref_caesar("abc xyz")
+            prompt = (
+                f"def caesar_encrypt(s):\n"
+                f"    \"\"\"Return the caesar-cipher of ``s`` shifted by {shift}.\n\n"
+                f"    Each letter is shifted forward by {shift} positions in the\n"
+                f"    alphabet, wrapping around (so 'z' shifted by 1 becomes 'a').\n"
+                f"    Letter case is preserved. Non-letter characters are left\n"
+                f"    unchanged.\n\n"
+                f"    >>> caesar_encrypt('abc xyz')\n"
+                f"    {ex_out!r}\n"
+                f"    \"\"\"\n"
+            )
+            test_inputs = [
+                "abc xyz", "Hello, World!", "ZZZ", "",
+                "".join(r.choice("abcdefghijklmnopqrstuvwxyz ABC")
+                        for _ in range(r.randint(3, 12))),
+            ]
+            for ti in test_inputs:
+                test_lines.append(f"    assert candidate({ti!r}) == {ref(ti)!r}")
+        elif kind == "flatten_nested_list":
+            entry_point = "flatten"
+            prompt = (
+                "def flatten(xs):\n"
+                "    \"\"\"Recursively flatten a nested list of integers.\n\n"
+                "    Inputs may contain integers OR other lists (nested to any\n"
+                "    depth). Return a flat list of integers in their original\n"
+                "    left-to-right order.\n\n"
+                "    >>> flatten([1, [2, [3, 4], 5], 6])\n"
+                "    [1, 2, 3, 4, 5, 6]\n"
+                "    >>> flatten([])\n"
+                "    []\n"
+                "    \"\"\"\n"
+            )
+            def _ref_flat(xs):
+                out_l: list = []
+                for x in xs:
+                    if isinstance(x, list):
+                        out_l.extend(_ref_flat(x))
+                    else:
+                        out_l.append(x)
+                return out_l
+
+            def _gen_nested(rr, depth_left):
+                # Return either a leaf int or a nested list, randomly.
+                if depth_left == 0 or rr.random() < 0.4:
+                    return rr.randint(-9, 9)
+                length = rr.randint(0, 4)
+                return [_gen_nested(rr, depth_left - 1) for _ in range(length)]
+
+            test_inputs = []
+            for _ in range(5):
+                test_inputs.append([_gen_nested(r, r.randint(1, 4))
+                                    for _ in range(r.randint(0, 4))])
+            for ti in test_inputs:
+                test_lines.append(f"    assert candidate({ti!r}) == {ref(ti) if False else _ref_flat(ti)!r}")
+        elif kind == "closest_pair_sum":
+            target = r.randint(-15, 30)
+            entry_point = "closest_pair_sum"
+
+            def _ref_closest(xs, t=target):
+                best = None
+                best_pair = None
+                for i in range(len(xs)):
+                    for j in range(i + 1, len(xs)):
+                        diff = abs(xs[i] + xs[j] - t)
+                        if best is None or diff < best:
+                            best = diff
+                            best_pair = (i, j)
+                return best_pair
+            ref = _ref_closest
+            example_out = _ref_closest([1, 7, 3, 2])
+            prompt = (
+                f"def closest_pair_sum(xs):\n"
+                f"    \"\"\"Return the indices ``(i, j)`` with i < j whose sum\n"
+                f"    ``xs[i] + xs[j]`` is closest to {target}. If multiple pairs\n"
+                f"    are equally close, return the lexicographically smallest\n"
+                f"    (i, j) tuple. The list always has at least two elements.\n\n"
+                f"    >>> closest_pair_sum([1, 7, 3, 2])\n"
+                f"    {example_out!r}\n"
+                f"    \"\"\"\n"
+            )
+            for _ in range(5):
+                n = r.randint(2, 8)
+                xs = [r.randint(-12, 18) for _ in range(n)]
+                test_lines.append(f"    assert candidate({xs!r}) == {ref(xs)!r}")
+        elif kind == "longest_palindromic_substring":
+            entry_point = "longest_palindrome"
+
+            def _ref_lps(s):
+                if not s:
+                    return ""
+                best = ""
+                for i in range(len(s)):
+                    for L, R in [(i, i), (i, i + 1)]:
+                        while L >= 0 and R < len(s) and s[L] == s[R]:
+                            L -= 1
+                            R += 1
+                        sub = s[L + 1:R]
+                        if len(sub) > len(best):
+                            best = sub
+                return best
+            ref = _ref_lps
+            ex_in = "babad"
+            ex_out = _ref_lps(ex_in)
+            prompt = (
+                f"def longest_palindrome(s):\n"
+                f"    \"\"\"Return the longest palindromic substring of ``s``.\n\n"
+                f"    A palindrome reads the same forwards and backwards. If\n"
+                f"    multiple substrings of the maximum length exist, return\n"
+                f"    the FIRST one (leftmost). For empty input, return ''.\n\n"
+                f"    >>> longest_palindrome({ex_in!r})\n"
+                f"    {ex_out!r}\n"
+                f"    >>> longest_palindrome('cbbd')\n"
+                f"    'bb'\n"
+                f"    \"\"\"\n"
+            )
+            test_inputs = [
+                "babad", "cbbd", "", "a", "aa", "abcba",
+                "abcdefg", "racecarxyz", "noon", "abccba",
+                "".join(r.choice("abcd") for _ in range(r.randint(8, 20))),
+            ]
+            for ti in test_inputs:
+                test_lines.append(f"    assert candidate({ti!r}) == {ref(ti)!r}")
+        elif kind == "group_anagrams":
+            entry_point = "group_anagrams"
+
+            def _ref_ga(strs):
+                groups: dict = {}
+                for s in strs:
+                    key = "".join(sorted(s))
+                    groups.setdefault(key, []).append(s)
+                # Return sorted by first member of each group lexicographically;
+                # within a group, preserve original order.
+                return sorted(groups.values(), key=lambda g: g[0])
+            ref = _ref_ga
+            ex_in = ["eat", "tea", "tan", "ate", "nat", "bat"]
+            ex_out = _ref_ga(ex_in)
+            prompt = (
+                f"def group_anagrams(strs):\n"
+                f"    \"\"\"Group strings that are anagrams of each other.\n\n"
+                f"    Return a list of groups, where each group is a list of\n"
+                f"    strings that are anagrams of each other. The outer list\n"
+                f"    is sorted by the FIRST member of each group lexicographically.\n"
+                f"    Within each group, preserve the original input order.\n\n"
+                f"    >>> group_anagrams({ex_in!r})\n"
+                f"    {ex_out!r}\n"
+                f"    >>> group_anagrams([])\n"
+                f"    []\n"
+                f"    \"\"\"\n"
+            )
+            words_pool = ["eat", "tea", "ate", "tan", "nat", "bat", "tab", "act",
+                          "cat", "tac", "rat", "art", "tar", "god", "dog"]
+            test_inputs = [
+                ["eat", "tea", "tan", "ate", "nat", "bat"],
+                [],
+                ["a"],
+                ["abc", "bca", "cab"],
+                r.sample(words_pool, r.randint(5, 10)),
+                ["xyz", "yzx", "zxy", "abc", "bca", "different"],
+            ]
+            for ti in test_inputs:
+                test_lines.append(f"    assert candidate({ti!r}) == {ref(ti)!r}")
+        elif kind == "kth_largest":
+            k_choices = [1, 2, 3]
+            k = r.choice(k_choices)
+            entry_point = "kth_largest"
+
+            def _ref_kth(xs, kk=k):
+                if not xs or kk > len(xs) or kk < 1:
+                    return None
+                return sorted(xs, reverse=True)[kk - 1]
+            ref = _ref_kth
+            ex_in = [3, 2, 1, 5, 6, 4]
+            ex_out = _ref_kth(ex_in)
+            prompt = (
+                f"def kth_largest(xs):\n"
+                f"    \"\"\"Return the {k}{'st' if k==1 else 'nd' if k==2 else 'rd'}\n"
+                f"    largest element of ``xs``. Duplicates count separately\n"
+                f"    (so kth_largest([3,3,3,3]) for k=2 returns 3). If ``xs``\n"
+                f"    has fewer than {k} elements, return None.\n\n"
+                f"    >>> kth_largest({ex_in!r})\n"
+                f"    {ex_out!r}\n"
+                f"    \"\"\"\n"
+            )
+            test_inputs = [
+                [3, 2, 1, 5, 6, 4],
+                [],
+                [1] if k == 1 else [1, 1],
+                [1, 1, 1, 1],
+                sorted([r.randint(-15, 30) for _ in range(r.randint(5, 12))]),
+                sorted([r.randint(-15, 30) for _ in range(r.randint(5, 12))], reverse=True),
+                [r.randint(-9, 9) for _ in range(r.randint(k, 15))],
+                [r.randint(-9, 9) for _ in range(r.randint(k, 15))],
+                [-5, -2, -10, -1, -3],
+            ]
+            for ti in test_inputs:
+                test_lines.append(f"    assert candidate({ti!r}) == {ref(ti)!r}")
+        elif kind == "run_length_decode":
+            entry_point = "rle_decode"
+            prompt = (
+                "def rle_decode(s):\n"
+                "    \"\"\"Decode a run-length-encoded string.\n\n"
+                "    The input is a string consisting of runs of (count)(char)\n"
+                "    where count is one OR more decimal digits. Each run\n"
+                "    expands to ``char`` repeated ``count`` times. Return the\n"
+                "    decoded string.\n\n"
+                "    >>> rle_decode('3a2b1c')\n"
+                "    'aaabbc'\n"
+                "    >>> rle_decode('12x')\n"
+                "    'xxxxxxxxxxxx'\n"
+                "    >>> rle_decode('')\n"
+                "    ''\n"
+                "    \"\"\"\n"
+            )
+            def _ref_rle(s):
+                out_s = []
+                i = 0
+                while i < len(s):
+                    j = i
+                    while j < len(s) and s[j].isdigit():
+                        j += 1
+                    if j == i or j >= len(s):
+                        # Malformed — but our test inputs are always well-formed.
+                        return ""
+                    count = int(s[i:j])
+                    char = s[j]
+                    out_s.append(char * count)
+                    i = j + 1
+                return "".join(out_s)
+            ref = _ref_rle
+            test_inputs = ["3a2b1c", "12x", "", "1a1b1c"]
+            for _ in range(2):
+                # Generate one well-formed random RLE string.
+                runs = []
+                for _ in range(r.randint(1, 4)):
+                    runs.append((r.randint(1, 9), r.choice("abcdef")))
+                test_inputs.append("".join(f"{n}{c}" for n, c in runs))
+            for ti in test_inputs:
+                test_lines.append(f"    assert candidate({ti!r}) == {ref(ti)!r}")
         else:
             entry_point = "noop"
             prompt = (
@@ -8999,13 +10591,22 @@ def _generate_code_items(block_seed, n_items: int) -> list[dict]:
             test_lines = ["    assert candidate() == 0"]
         # ─────────────────────────────────────────────────────────────────
         test_block = "def check(candidate):\n" + "\n".join(test_lines) + "\n"
-        version_tag = "v29" if kind in (
+        if kind in (
+            "caesar_cipher", "flatten_nested_list",
+            "closest_pair_sum", "run_length_decode",
+            "longest_palindromic_substring", "group_anagrams", "kth_largest",
+        ):
+            version_tag = "v30"
+        elif kind in (
             "coin_change_min", "merge_intervals", "rolling_max",
             "nested_paren_groups", "evaluate_postfix", "roman_to_int",
             "binary_search_first", "unique_paths_grid", "longest_no_repeat",
             "validate_brackets", "sliding_window_min", "most_freq_elem",
             "compress_string", "two_sum_pairs",
-        ) else "v27"
+        ):
+            version_tag = "v29"
+        else:
+            version_tag = "v27"
         out.append({
             "src": f"procedural_code/{kind}",
             "task_id": f"{version_tag}/{kind}/{i:02d}",
@@ -9068,11 +10669,19 @@ def _generate_debug_items(block_seed, n_items: int) -> list[dict]:
     without breaking other behaviour).
     """
     import random
+    # 2026-05-02 (v30.5): added 4 more subtle bug kinds to push debug
+    # difficulty up. The new kinds are subtler than the original 8:
+    #   - mutable_default_arg: classic Python footgun (def f(xs=[]):)
+    #   - shallow_vs_deep_copy: list copy doesn't recurse into nested
+    #   - integer_division_drift: int / int when float is needed
+    #   - aliased_loop_var: late binding in closure / lambda
     rng = random.Random((int(block_seed or 0) ^ _BENCH_STREAM["debug"]) & 0xFFFFFFFF)
     bug_kinds = [
         "off_by_one_range", "swap_subtract", "wrong_comparator",
         "wrong_init", "early_break", "wrong_index", "wrong_modulo",
         "missing_edge_case",
+        "mutable_default_arg", "shallow_vs_deep_copy",
+        "integer_division_drift", "aliased_loop_var",
     ]
     pool = (bug_kinds * ((n_items // len(bug_kinds)) + 1))[:n_items]
     rng.shuffle(pool)
@@ -9240,7 +10849,7 @@ def _generate_debug_items(block_seed, n_items: int) -> list[dict]:
                 f"    assert candidate(0, modulus={mod}) == 0",
                 f"    assert candidate({mod-1}, modulus={mod}) == {2 * (mod-1)}",
             ]
-        else:  # missing_edge_case
+        elif kind == "missing_edge_case":
             entry = "first_or_default"
             buggy = (
                 "def first_or_default(arr, default=None):\n"
@@ -9260,6 +10869,111 @@ def _generate_debug_items(block_seed, n_items: int) -> list[dict]:
                 "    assert candidate([], default=-1) == -1",
                 "    assert candidate(['a']) == 'a'",
                 "    assert candidate([], default=[]) == []",
+            ]
+        elif kind == "mutable_default_arg":
+            entry = "append_to_history"
+            buggy = (
+                "def append_to_history(item, history=[]):\n"
+                '    """Append item to history (list); return updated history."""\n'
+                "    history.append(item)\n"
+                "    return history\n"
+            )
+            sig = (
+                "def append_to_history(item, history=None):\n"
+                '    """Append item to history and return it. If no history\n'
+                "    is given, start a FRESH new list (not a shared default).\n"
+                "    Each call with no history must start independent.\n"
+                "    Example: a = append_to_history(1); b = append_to_history(2);\n"
+                "    then a == [1] and b == [2] (NOT b == [1, 2])."
+                '\n    """\n'
+            )
+            tests = [
+                "    a = candidate(1); b = candidate(2)",
+                "    assert a == [1]",
+                "    assert b == [2]",
+                "    assert candidate(5, [3, 4]) == [3, 4, 5]",
+                "    assert candidate('x') == ['x']",
+            ]
+        elif kind == "shallow_vs_deep_copy":
+            entry = "duplicate_grid"
+            buggy = (
+                "def duplicate_grid(grid):\n"
+                '    """Return an independent copy of a 2D grid (list of lists)."""\n'
+                "    return list(grid)\n"
+            )
+            sig = (
+                "def duplicate_grid(grid: list) -> list:\n"
+                '    """Return an INDEPENDENT copy of a 2D grid (list of lists)\n'
+                "    such that mutating the returned copy does NOT affect the\n"
+                "    original. The grid is a list of integer lists.\n"
+                "    Example: g = [[1, 2], [3]]; d = duplicate_grid(g);\n"
+                "             d[0].append(99); g still equals [[1, 2], [3]]."
+                '\n    """\n'
+            )
+            tests = [
+                "    g = [[1, 2], [3, 4]]",
+                "    d = candidate(g)",
+                "    d[0].append(99)",
+                "    assert g == [[1, 2], [3, 4]]",
+                "    assert d == [[1, 2, 99], [3, 4]]",
+                "    g2 = [[5]]; d2 = candidate(g2); d2[0][0] = 7; assert g2 == [[5]]",
+            ]
+        elif kind == "integer_division_drift":
+            entry = "average_of"
+            buggy = (
+                "def average_of(xs):\n"
+                '    """Return the arithmetic mean of xs as a float."""\n'
+                "    if not xs: return 0.0\n"
+                "    total = 0\n"
+                "    for x in xs: total += x\n"
+                "    return total // len(xs)\n"
+            )
+            sig = (
+                "def average_of(xs: list) -> float:\n"
+                '    """Return the arithmetic mean of xs as a FLOAT (not an\n'
+                "    integer). Empty list returns 0.0.\n"
+                "    Example: average_of([1, 2, 3]) returns 2.0;\n"
+                "             average_of([1, 2, 4]) returns 2.333... (a float)."
+                '\n    """\n'
+            )
+            tests = [
+                "    assert abs(candidate([1, 2, 3]) - 2.0) < 1e-9",
+                "    assert abs(candidate([1, 2, 4]) - 7/3) < 1e-9",
+                "    assert candidate([]) == 0.0",
+                "    assert abs(candidate([5, 5, 5]) - 5.0) < 1e-9",
+                "    assert abs(candidate([2, 4, 6, 8]) - 5.0) < 1e-9",
+                "    assert isinstance(candidate([1, 2]), float)",
+            ]
+        else:  # aliased_loop_var
+            entry = "make_adders"
+            buggy = (
+                "def make_adders(ks):\n"
+                '    """Return list of fns where fn[i](x) returns x + ks[i]."""\n'
+                "    fns = []\n"
+                "    for k in ks:\n"
+                "        fns.append(lambda x: x + k)\n"
+                "    return fns\n"
+            )
+            sig = (
+                "def make_adders(ks: list) -> list:\n"
+                '    """Return a list of functions, where the i-th function\n'
+                "    takes x and returns x + ks[i]. The returned functions\n"
+                "    must each capture their own ks[i] independently — calling\n"
+                "    the first function should not be affected by later\n"
+                "    iterations of the loop.\n"
+                "    Example: fns = make_adders([1, 2, 5]);\n"
+                "             [f(10) for f in fns] returns [11, 12, 15]."
+                '\n    """\n'
+            )
+            tests = [
+                "    fns = candidate([1, 2, 5])",
+                "    assert [f(10) for f in fns] == [11, 12, 15]",
+                "    fns2 = candidate([7])",
+                "    assert fns2[0](100) == 107",
+                "    fns3 = candidate([])",
+                "    assert fns3 == []",
+                "    fns4 = candidate([0, 0])",
+                "    assert [f(5) for f in fns4] == [5, 5]",
             ]
 
         # The buggy version goes in the prompt as a comment block so it
@@ -9654,10 +11368,19 @@ def _generate_multi_doc_items(block_seed, n_items: int) -> list[dict]:
     per-item RNG-derived seeds. Numbers are calibrated to be in
     distinct ranges per topic so substring collisions don't sneak in.
     """
+    # 2026-05-02 (v30.5): hardened. Default n_cards 4 → 7, and added two
+    # 3-document synthesis kinds (``sum_three``, ``difference_three``)
+    # so ~30 % of items require retrieving and combining THREE values
+    # rather than two. The bigger card pool also means the
+    # confuser-rejection grader has more values to NOT match against,
+    # raising the bar against models that "mention all numbers".
     import random
     rng = random.Random((int(block_seed or 0) ^ _BENCH_STREAM["multi_doc"]) & 0xFFFFFFFF)
-    qkinds = ["sum", "difference", "compare", "ratio"]
-    n_cards = max(2, BENCH_MULTI_DOC_N_CARDS)
+    qkinds = ["sum", "difference", "compare", "ratio",
+              "sum_three", "difference_three"]
+    # Default to 7 cards if env override not set; allow operator override.
+    _n_cards_default = max(BENCH_MULTI_DOC_N_CARDS, 7)
+    n_cards = max(3, _n_cards_default)
     out: list[dict] = []
     for i in range(n_items):
         r = random.Random(rng.randint(0, 2**31 - 1))
@@ -9745,13 +11468,46 @@ def _generate_multi_doc_items(block_seed, n_items: int) -> list[dict]:
                 f"and {b_topic}, which one has the LARGER value? Reply "
                 f"with the full name of the larger one."
             )
-        else:  # ratio (integer division to keep gold an integer)
+        elif kind == "ratio":
             larger, smaller = (a_val, b_val) if a_val >= b_val else (b_val, a_val)
             gold = str(larger // smaller)
             question = (
                 f"How many times larger (rounded down to integer) is the "
                 f"numeric attribute of {a_topic} compared to {b_topic}? "
                 f"If {a_topic} is smaller, swap the order. Reply with the integer only."
+            )
+        elif kind == "sum_three":
+            # 3-document synthesis: sum the values across three topics.
+            if n_cards < 3:
+                # Skip if not enough cards; should not happen with default 7.
+                continue
+            third_pool = [ci for ci in range(n_cards) if ci not in (a_idx, b_idx)]
+            c_idx = r.choice(third_pool)
+            c_topic = topics[c_idx]
+            c_val = values[c_idx]
+            gold = str(a_val + b_val + c_val)
+            question = (
+                f"Considering only {a_topic}, {b_topic}, and {c_topic}, "
+                f"what is the COMBINED total of the numeric attribute "
+                f"reported in their three documents? Reply with the "
+                f"integer only."
+            )
+        else:  # difference_three
+            # 3-document synthesis: max minus mid minus min.
+            if n_cards < 3:
+                continue
+            third_pool = [ci for ci in range(n_cards) if ci not in (a_idx, b_idx)]
+            c_idx = r.choice(third_pool)
+            c_topic = topics[c_idx]
+            c_val = values[c_idx]
+            three = sorted([(a_val, a_topic), (b_val, b_topic),
+                            (c_val, c_topic)], reverse=True)
+            gold = str(three[0][0] - three[1][0] - three[2][0])
+            question = (
+                f"Considering only {a_topic}, {b_topic}, and {c_topic}: "
+                f"take the LARGEST of the three numeric attributes, "
+                f"subtract the MIDDLE one, then subtract the SMALLEST. "
+                f"Reply with the integer only."
             )
         # Confusers: numeric values from cards NOT used in the gold.
         # These should not appear as standalone integers in the response.
@@ -9764,17 +11520,27 @@ def _generate_multi_doc_items(block_seed, n_items: int) -> list[dict]:
             # Add the LOSER as a confuser too — model must commit.
             loser_t = b_topic if a_val > b_val else a_topic
             confuser_answers.append(loser_t)
+        elif kind in ("sum_three", "difference_three"):
+            # Three-card kind: the third card's value is "involved", so
+            # only OTHER cards' values count as confusers.
+            involved = {a_idx, b_idx, c_idx}
+            confuser_answers = [
+                str(values[ci]) for ci in range(n_cards) if ci not in involved
+            ]
         else:
             confuser_answers = [
                 str(values[ci]) for ci in range(n_cards) if ci not in (a_idx, b_idx)
             ]
+        topics_for_record = [a_topic, b_topic]
+        if kind in ("sum_three", "difference_three"):
+            topics_for_record = [a_topic, b_topic, c_topic]
         out.append({
             "src": f"multi_doc_synthesis/{kind}",
             "context": document,
             "question": question,
             "answer": gold,
             "confuser_answers": confuser_answers,
-            "involved_topics": [a_topic, b_topic],
+            "involved_topics": topics_for_record,
             "kind": kind,
         })
     return out
@@ -10175,32 +11941,81 @@ def _generate_calibration_items(block_seed, n_items: int) -> list[dict]:
          "{b} books. How many books has {name} borrowed total? Reply with an integer.",
          lambda a, b: a + b),
     ]
+    # 2026-05-02 (v30.5): added two adversarial unsolvable kinds.
+    # Standard ``unsolv`` items are EASY to detect — the missing slot is
+    # obvious (e.g. "{name} owns books in the kitchen and {b} books..."
+    # — clearly missing a number). Adversarial unsolvables are MUCH
+    # harder:
+    #   - ``contradiction``: data is self-inconsistent (totals + parts
+    #     given disagree). A model that pattern-matches arithmetic
+    #     templates will compute the wrong answer; only a careful
+    #     reader notices the contradiction.
+    #   - ``unit_mismatch``: parts use incompatible units that aren't
+    #     convertible without an unstated rate (e.g. eggs + dozens
+    #     where the dozen-size isn't given). Confabulators will assume
+    #     12; calibrated models refuse.
+    # 30% of unsolvable items are adversarial; the rest stay as the
+    # easier "missing slot" form so the easy-floor remains in place.
     out: list[dict] = []
-    plan = (["solv"] * n_solv) + (["unsolv"] * n_unsolv)
+    plan_solv = ["solv"] * n_solv
+    n_adv = max(0, int(round(n_unsolv * 0.30)))
+    n_simple = n_unsolv - n_adv
+    plan = (
+        plan_solv
+        + ["unsolv"] * n_simple
+        + ["contradiction"] * (n_adv // 2 + n_adv % 2)
+        + ["unit_mismatch"] * (n_adv // 2)
+    )
     rng.shuffle(plan)
     for i, plan_kind in enumerate(plan):
         r = random.Random(rng.randint(0, 2**31 - 1))
         tmpl_id, solv_template, unsolv_template, gold_fn = r.choice(templates)
         a, b = r.randint(5, 60), r.randint(5, 60)
-        # v29.5: procedurally synthesise a fresh name per item; no
-        # static name pool to memorise.
-        name = _synthetic_name(r)
+        name = _realistic_name(r)
         if plan_kind == "solv":
             question = solv_template.format(a=a, b=b, name=name)
             gold = str(gold_fn(a, b))
-        else:
-            # Pass both a + b: each unsolv template omits ONE of the
-            # two slots and may legitimately reference the other (e.g.
-            # the orchard template keeps {a} but drops {b}, the books
-            # template keeps {b} but drops {a}). Passing both is safe
-            # because Python ignores extra kwargs in str.format.
+            kind_tag = "solv"
+        elif plan_kind == "unsolv":
             question = unsolv_template.format(a=a, b=b, name=name)
-            gold = "REFUSE"  # sentinel; grader handles refusal recognition
+            gold = "REFUSE"
+            kind_tag = "unsolv"
+        elif plan_kind == "contradiction":
+            # Adversarial: present a part-and-total that contradict each
+            # other. The model should recognise the inconsistency rather
+            # than pick one number to compute with.
+            wrong_total = a + b + r.randint(3, 12)  # off by 3-12
+            question = (
+                f"{name} owns {a} books in the kitchen and {b} books in "
+                f"the study. {name} also reports owning a TOTAL of "
+                f"{wrong_total} books across both rooms. How many books "
+                f"does {name} own in total? Reply with an integer if the "
+                f"answer is determinable, else explain why."
+            )
+            gold = "REFUSE"
+            kind_tag = "unsolv_adversarial_contradiction"
+        else:  # unit_mismatch
+            n_eggs = r.randint(40, 200)
+            n_dozens = r.randint(2, 9)
+            question = (
+                f"A farm collects {n_eggs} eggs in the morning and "
+                f"{n_dozens} dozens of eggs in the afternoon. (No "
+                f"information is given about how many eggs are in a "
+                f"dozen on this farm.) How many eggs were collected in "
+                f"total? Reply with an integer if the answer is "
+                f"determinable, else explain why."
+            )
+            # NB: this is a trick — most readers assume 12 eggs/dozen,
+            # but the problem says nothing about it. A calibrated model
+            # should at least flag the assumption.
+            gold = "REFUSE"
+            kind_tag = "unsolv_adversarial_unit_mismatch"
         out.append({
-            "src": f"calibration/{tmpl_id}/{plan_kind}",
+            "src": f"calibration/{tmpl_id}/{kind_tag}",
             "question": question,
             "answer": gold,
-            "kind": plan_kind,  # "solv" or "unsolv"
+            "kind": plan_kind if plan_kind in ("solv", "unsolv") else "unsolv",
+            "adversarial": plan_kind in ("contradiction", "unit_mismatch"),
         })
     return out
 
@@ -10284,15 +12099,20 @@ def _generate_pragmatic_items(block_seed, n_items: int) -> list[dict]:
 
         if subtype == "false_belief":
             # Actor X, actor Y, object, two containers.
-            names = _synthetic_names(r, 2)
+            # 2026-05-01 (v30.4 patch v4): real names + concrete objects
+            # so the prompt is readable. Anti-memorisation preserved
+            # because the (name1, name2, obj, container1, container2,
+            # question_type) combinatoric is ~22B unique scenarios per
+            # block_seed.
+            names = _realistic_names(r, 2)
             x_name, y_name = names[0], names[1]
-            obj = _synthetic_word(r, 2)
-            container_1 = _synthetic_word(r, 2)
-            container_2 = _synthetic_word(r, 2)
+            obj = _realistic_object(r)
+            container_1 = _realistic_container(r)
+            container_2 = _realistic_container(r)
             while container_2 == container_1:
-                container_2 = _synthetic_word(r, 2)
+                container_2 = _realistic_container(r)
             scenario = (
-                f"{x_name} places a {obj} inside the {container_1}. "
+                f"{x_name} places the {obj} inside the {container_1}. "
                 f"{x_name} then leaves the room. While {x_name} is "
                 f"away, {y_name} moves the {obj} from the {container_1} "
                 f"to the {container_2}. A few minutes later, "
@@ -10303,17 +12123,35 @@ def _generate_pragmatic_items(block_seed, n_items: int) -> list[dict]:
                 question = (
                     scenario +
                     f" Where will {x_name} look for the {obj} first? "
-                    f"Reply with the container name only."
+                    f"Reply with just the container name (one or two "
+                    f"words, no article)."
                 )
                 gold = container_1
             else:
                 question = (
                     scenario +
                     f" Where is the {obj} actually located now? "
-                    f"Reply with the container name only."
+                    f"Reply with just the container name (one or two "
+                    f"words, no article)."
                 )
                 gold = container_2
-            accept = _accept_word(gold)
+            # Match the LAST word of the gold ("kitchen drawer" → "drawer")
+            # so two-word containers still grade right when the model
+            # answers with just the head noun. BUT only accept the head
+            # noun when the OTHER container's head noun is different —
+            # otherwise "drawer" alone is ambiguous (could mean either
+            # "sock drawer" or "kitchen drawer"). When the heads collide
+            # we require the model to emit the full discriminating
+            # container name.
+            other = container_2 if gold == container_1 else container_1
+            gold_last = gold.split()[-1].lower()
+            other_last = other.split()[-1].lower()
+            accept_patterns = [re.compile(rf"\b{re.escape(gold)}\b", re.IGNORECASE)]
+            if gold_last != other_last:
+                accept_patterns.append(
+                    re.compile(rf"\b{re.escape(gold_last)}\b", re.IGNORECASE)
+                )
+            accept = accept_patterns
         elif subtype == "scalar_implicature":
             # All weak quantifiers pair with the strong quantifier
             # ``all`` rather than ``every`` because ``all`` takes the
@@ -10327,7 +12165,7 @@ def _generate_pragmatic_items(block_seed, n_items: int) -> list[dict]:
                 ("a few", "all"),
             ])
             # Build a domain scenario.
-            speaker = _synthetic_name(r)
+            speaker = _realistic_name(r)
             domain = r.choice([
                 ("students", "passed the exam"),
                 ("athletes", "finished the race"),
@@ -10365,7 +12203,7 @@ def _generate_pragmatic_items(block_seed, n_items: int) -> list[dict]:
         elif subtype == "epistemic_state_tracking":
             # Three actors A, B, C. Information X is initially known
             # only by A. A tells B. C is not told. Question: does C know?
-            names = _synthetic_names(r, 3)
+            names = _realistic_names(r, 3)
             a_name, b_name, c_name = names[0], names[1], names[2]
             secret = r.choice(["password", "address", "schedule",
                                "code", "answer", "destination"])
@@ -10405,7 +12243,7 @@ def _generate_pragmatic_items(block_seed, n_items: int) -> list[dict]:
                 "could_you", "would_you_please", "do_you_have",
                 "is_it_possible",
             ])
-            speaker = _synthetic_name(r)
+            speaker = _realistic_name(r)
             # Each action is given as a base-form (infinitive without
             # 'to') verb phrase so all four template phrasings remain
             # grammatical without requiring gerund conjugation.
@@ -10583,6 +12421,85 @@ def _generate_refactor_items(block_seed, n_items: int) -> list[dict]:
              "    assert candidate([[1], [2], [3]]) == [1, 2, 3]",
          ],
         ),
+        # 2026-05-02 (v30.5): three more refactor templates for breadth.
+        ("find_max_ugly", "find_max_in_list",
+         (
+             "def find_max_in_list(xs):\n"
+             "    biggest = None\n"
+             "    for x in xs:\n"
+             "        if biggest is None:\n"
+             "            biggest = x\n"
+             "        else:\n"
+             "            if x > biggest:\n"
+             "                biggest = x\n"
+             "    if biggest is None:\n"
+             "        return None\n"
+             "    return biggest\n"
+         ),
+         (
+             "def find_max_in_list(xs: list[int]) -> int | None:\n"
+             '    """Return the maximum integer in xs, or None if xs is empty."""\n'
+         ),
+         [
+             "    assert candidate([3, 1, 4, 1, 5, 9, 2, 6]) == 9",
+             "    assert candidate([7]) == 7",
+             "    assert candidate([]) is None",
+             "    assert candidate([-3, -1, -7]) == -1",
+             "    assert candidate([2, 2, 2]) == 2",
+         ],
+        ),
+        ("count_uniques_ugly", "count_unique",
+         (
+             "def count_unique(xs):\n"
+             "    seen = []\n"
+             "    for x in xs:\n"
+             "        already = False\n"
+             "        for y in seen:\n"
+             "            if y == x:\n"
+             "                already = True\n"
+             "        if not already:\n"
+             "            seen.append(x)\n"
+             "    return len(seen)\n"
+         ),
+         (
+             "def count_unique(xs: list[int]) -> int:\n"
+             '    """Return the number of distinct integers in xs."""\n'
+         ),
+         [
+             "    assert candidate([1, 2, 1, 3, 2, 1]) == 3",
+             "    assert candidate([]) == 0",
+             "    assert candidate([5, 5, 5, 5]) == 1",
+             "    assert candidate([1, 2, 3, 4, 5]) == 5",
+         ],
+        ),
+        ("pair_sum_ugly", "any_pair_sums_to",
+         (
+             "def any_pair_sums_to(xs, target):\n"
+             "    found = False\n"
+             "    for i in range(len(xs)):\n"
+             "        for j in range(len(xs)):\n"
+             "            if i != j:\n"
+             "                if xs[i] + xs[j] == target:\n"
+             "                    found = True\n"
+             "    return found\n"
+         ),
+         (
+             "def any_pair_sums_to(xs: list[int], target: int) -> bool:\n"
+             '    """Return True if any two distinct-indexed elements of xs\n'
+             "    sum to target. Each index is used at most once per pair.\n"
+             "    Examples: any_pair_sums_to([1, 2, 3, 4], 7) is True; "
+             "any_pair_sums_to([5], 5) is False (only one element)."
+             '\n    """\n'
+         ),
+         [
+             "    assert candidate([1, 2, 3, 4], 7) is True",
+             "    assert candidate([1, 2, 3, 4], 8) is False",
+             "    assert candidate([5], 5) is False",
+             "    assert candidate([], 0) is False",
+             "    assert candidate([3, 3], 6) is True",
+             "    assert candidate([0, 0, 0], 0) is True",
+         ],
+        ),
     ]
     out: list[dict] = []
     for i, kind in enumerate(pool):
@@ -10692,7 +12609,19 @@ def _generate_reasoning_items(block_seed, n_items: int) -> list[dict]:
     """
     import random
     rng = random.Random((int(block_seed or 0) ^ _BENCH_STREAM["reasoning"]) & 0xFFFFFFFF)
-    hard_kinds = ["date_arithmetic", "web_of_lies", "navigate_steps", "tracking_objects"]
+    # 2026-05-01 (v30.4 patch v4): added 3 new reasoning subtypes —
+    # graph_shortest_path (SSSP on a 4-6 node weighted graph),
+    # graph_connectivity (is there a path A→B in a directed graph?),
+    # constraint_sat (small CSP / 3-actor scheduling).
+    # All three are weakness areas of distilled-only models per the
+    # held-out canary audit; the procedural rotation is hardcoded so
+    # memorisation stays impossible (each round samples fresh random
+    # graph topology + edge weights).
+    hard_kinds = [
+        "date_arithmetic", "web_of_lies", "navigate_steps",
+        "tracking_objects", "graph_shortest_path",
+        "graph_connectivity", "constraint_sat",
+    ]
     legacy_kinds = ["boolean_eval", "ordering", "deduction", "sequence_next",
                     "odd_one_out", "analogy_letter"]
     n_hard = max(1, (n_items * 70 + 50) // 100)
@@ -10882,13 +12811,18 @@ def _generate_reasoning_items(block_seed, n_items: int) -> list[dict]:
                            "procedural_reasoning/analogy_letter"))
         # ── v29 hard tier (BBH-distribution-similar) ────────────────────
         elif kind == "date_arithmetic":
+            # 2026-05-02 (v30.5): expand year range to include leap years
+            # (2020, 2024, 2028) and bump delta range 7-95 → 30-450 days
+            # so a non-trivial fraction of items cross a leap-day or
+            # year boundary, exposing models that estimate via "30 days
+            # per month" shortcuts.
             from datetime import date, timedelta
-            year = r.choice([2023, 2024])
+            year = r.choice([2020, 2021, 2022, 2023, 2024, 2025, 2026, 2027, 2028])
             month = r.randint(1, 12)
             day = r.randint(1, 28)
             d0 = date(year, month, day)
             direction = r.choice(["after", "before"])
-            delta = r.randint(7, 95)
+            delta = r.randint(30, 450)
             if direction == "after":
                 target = d0 + timedelta(days=delta)
             else:
@@ -10912,9 +12846,13 @@ def _generate_reasoning_items(block_seed, n_items: int) -> list[dict]:
             out.append(_mc(qtext, options, gold_idx,
                            "procedural_reasoning/date_arithmetic"))
         elif kind == "web_of_lies":
-            n_chain = r.randint(3, 5)
-            people = _synthetic_names(r,
-                              n_chain)
+            # 2026-05-02 (v30.5): chain length 3-5 → 5-7 actors + real
+            # names. Hand-test confirms a 5+ actor chain is solvable but
+            # exposes any model that "guesses true if mostly true" —
+            # the parity flips are non-trivial. Real names also let
+            # the prompt read like a logic puzzle textbook item.
+            n_chain = r.randint(5, 7)
+            people = _realistic_names(r, n_chain)
             truth = [r.choice([True, False]) for _ in range(n_chain)]
             statements = []
             for i in range(1, n_chain):
@@ -10939,12 +12877,15 @@ def _generate_reasoning_items(block_seed, n_items: int) -> list[dict]:
             out.append(_mc(qtext, options, gold_idx,
                            "procedural_reasoning/web_of_lies"))
         elif kind == "navigate_steps":
+            # 2026-05-02 (v30.5): step count 3-6 → 6-10 to deepen
+            # state-tracking demand. Each step requires updating
+            # heading + position; longer chains compound errors.
             cardinals = ["north", "east", "south", "west"]
             initial = r.choice(cardinals)
             heading_idx = cardinals.index(initial)
             x, y = 0, 0
             steps_log = []
-            for _ in range(r.randint(3, 6)):
+            for _ in range(r.randint(6, 10)):
                 kind2 = r.choice(["walk", "turn_left", "turn_right", "turn_around"])
                 if kind2 == "walk":
                     n = r.randint(1, 7)
@@ -10992,11 +12933,16 @@ def _generate_reasoning_items(block_seed, n_items: int) -> list[dict]:
             out.append(_mc(qtext, options, gold_idx,
                            "procedural_reasoning/navigate_steps"))
         elif kind == "tracking_objects":
-            n = r.randint(3, 4)
-            people = _synthetic_names(r, n)
-            colors = r.sample(["red", "blue", "green", "yellow", "purple", "orange"], n)
+            # 2026-05-02 (v30.5): 3-4 actors → 4-6 actors, 2-4 swaps
+            # → 4-7 swaps. Larger swap chain forces the model to
+            # actually track each ball's location across more steps,
+            # not just guess by recency.
+            n = r.randint(4, 6)
+            people = _realistic_names(r, n)
+            colors = r.sample(["red", "blue", "green", "yellow", "purple", "orange",
+                               "white", "black"], n)
             holds = dict(zip(people, colors))
-            n_swaps = r.randint(2, 4)
+            n_swaps = r.randint(4, 7)
             ops = []
             for _ in range(n_swaps):
                 a, b = r.sample(people, 2)
@@ -11025,6 +12971,201 @@ def _generate_reasoning_items(block_seed, n_items: int) -> list[dict]:
             gold_idx = options.index(ans)
             out.append(_mc(qtext, options, gold_idx,
                            "procedural_reasoning/tracking_objects"))
+        elif kind == "graph_shortest_path":
+            # Single-source shortest-path on a small undirected weighted
+            # graph (4-6 nodes, 5-8 edges, weights 1-9). Generated by
+            # placing nodes at fixed labels (cities) and randomly
+            # connecting until both source and target are reachable.
+            # Solved with Dijkstra to compute the gold cost. The
+            # multiple-choice options include three distractors that
+            # differ from the gold by ±1, ±2, or use a slightly-longer
+            # sub-optimal path.
+            cities = ["Aria", "Brenn", "Clev", "Dorin", "Esia", "Fyrn"]
+            n_nodes = r.randint(4, 6)
+            nodes = cities[:n_nodes]
+            edges: list[tuple[str, str, int]] = []
+            # Random spanning tree first to guarantee connectivity.
+            shuf = list(nodes)
+            r.shuffle(shuf)
+            for i in range(1, len(shuf)):
+                a = shuf[i]
+                b = shuf[r.randint(0, i - 1)]
+                w = r.randint(1, 9)
+                edges.append((a, b, w))
+            # Add 1-3 extra random edges for choice variety.
+            for _ in range(r.randint(1, 3)):
+                a, b = r.sample(nodes, 2)
+                if any({a, b} == {x, y} for x, y, _ in edges):
+                    continue
+                edges.append((a, b, r.randint(1, 9)))
+            # Dijkstra.
+            adj: dict[str, list[tuple[str, int]]] = {n: [] for n in nodes}
+            for a, b, w in edges:
+                adj[a].append((b, w))
+                adj[b].append((a, w))
+            src, dst = r.sample(nodes, 2)
+            INF = 10 ** 9
+            dist = {n: INF for n in nodes}
+            dist[src] = 0
+            visited: set[str] = set()
+            while True:
+                cur = None
+                cur_d = INF
+                for n in nodes:
+                    if n not in visited and dist[n] < cur_d:
+                        cur, cur_d = n, dist[n]
+                if cur is None:
+                    break
+                visited.add(cur)
+                for nb, w in adj[cur]:
+                    if dist[cur] + w < dist[nb]:
+                        dist[nb] = dist[cur] + w
+            gold_cost = dist[dst]
+            edge_list = "; ".join(
+                f"{a}↔{b} (cost {w})" for a, b, w in edges
+            )
+            qtext = (
+                f"You have a network of cities connected by roads with "
+                f"the following costs: {edge_list}. What is the minimum "
+                f"total cost to travel from {src} to {dst}?"
+            )
+            opts_set: set[int] = {gold_cost}
+            for _ in range(8):
+                if len(opts_set) >= 4:
+                    break
+                delta = r.choice([-2, -1, 1, 2, 3, -3])
+                cand = max(1, gold_cost + delta)
+                opts_set.add(cand)
+            opts_int = sorted(opts_set)[:4]
+            while len(opts_int) < 4:
+                opts_int.append(opts_int[-1] + r.randint(1, 4))
+            opts_str = [str(o) for o in opts_int]
+            r.shuffle(opts_str)
+            gold_idx = opts_str.index(str(gold_cost))
+            out.append(_mc(qtext, opts_str, gold_idx,
+                           "procedural_reasoning/graph_shortest_path"))
+        elif kind == "graph_connectivity":
+            # Directed reachability. Generate a small DAG with N nodes
+            # and ~N*1.5 edges. Question: "Can A reach B?" where the
+            # answer is split ~50/50 yes/no by sometimes asking about
+            # an unreachable pair.
+            nodes_pool = ["Hub", "Node", "Vertex", "Point",
+                          "Station", "Center", "Spot", "Plot"]
+            n = r.randint(4, 6)
+            nodes = [f"{nodes_pool[i]}_{i + 1}" for i in range(n)]
+            edges: list[tuple[str, str]] = []
+            for i in range(n):
+                for j in range(i + 1, n):
+                    if r.random() < 0.45:
+                        edges.append((nodes[i], nodes[j]))
+            # Reachability via BFS.
+            adj: dict[str, list[str]] = {n0: [] for n0 in nodes}
+            for a, b in edges:
+                adj[a].append(b)
+            src = r.choice(nodes)
+            dst_candidates = [n0 for n0 in nodes if n0 != src]
+            r.shuffle(dst_candidates)
+            # Compute reachable set from src.
+            reachable: set[str] = {src}
+            stack = [src]
+            while stack:
+                cur = stack.pop()
+                for nb in adj[cur]:
+                    if nb not in reachable:
+                        reachable.add(nb)
+                        stack.append(nb)
+            # Pick dst to balance yes/no roughly 50/50 if possible.
+            dst = None
+            want_yes = r.random() < 0.5
+            for cand in dst_candidates:
+                if want_yes and cand in reachable:
+                    dst = cand
+                    break
+                if not want_yes and cand not in reachable:
+                    dst = cand
+                    break
+            if dst is None:
+                dst = dst_candidates[0]
+            gold_yes = dst in reachable
+            edge_str = ", ".join(f"{a}→{b}" for a, b in edges)
+            qtext = (
+                f"In a directed network with edges: {edge_str}. "
+                f"Is there a directed path from {src} to {dst} "
+                f"(following edges in the direction shown)?"
+            )
+            options = ["yes", "no", "only sometimes", "cannot be determined"]
+            r.shuffle(options)
+            gold_idx = options.index("yes" if gold_yes else "no")
+            out.append(_mc(qtext, options, gold_idx,
+                           "procedural_reasoning/graph_connectivity"))
+        elif kind == "constraint_sat":
+            # 3-actor scheduling CSP. Three people, three time slots
+            # (morning / afternoon / evening), and three constraints
+            # like "X cannot be at slot S", "Y must be before Z", etc.
+            # Question: which person is in which slot? Solved by brute
+            # force over the 3! = 6 permutations.
+            people = _realistic_names(r, 3)
+            slots = ["morning", "afternoon", "evening"]
+            slot_order = {s: i for i, s in enumerate(slots)}
+            from itertools import permutations as _perm
+            # Generate random constraints; loop until exactly one
+            # permutation satisfies them all.
+            for _ in range(20):
+                cons_text: list[str] = []
+                cons_fns = []
+                # Constraint type 1: X cannot be at slot S.
+                ban_p = r.choice(people)
+                ban_s = r.choice(slots)
+                cons_text.append(f"{ban_p} cannot be in the {ban_s} slot.")
+                cons_fns.append(lambda perm, p=ban_p, s=ban_s: perm[people.index(p)] != s)
+                # Constraint type 2: Y is in an earlier slot than Z.
+                y, z = r.sample(people, 2)
+                cons_text.append(f"{y} is in an earlier slot than {z}.")
+                cons_fns.append(lambda perm, y=y, z=z: slot_order[perm[people.index(y)]] < slot_order[perm[people.index(z)]])
+                # Constraint type 3: third person is in slot Q.
+                rest = [p for p in people if p not in (y, z)]
+                if rest:
+                    other_p = rest[0]
+                    other_s = r.choice([s for s in slots if s != ban_s])
+                    cons_text.append(f"{other_p} is in the {other_s} slot.")
+                    cons_fns.append(lambda perm, p=other_p, s=other_s: perm[people.index(p)] == s)
+                solutions: list[tuple] = []
+                for perm in _perm(slots):
+                    if all(fn(perm) for fn in cons_fns):
+                        solutions.append(perm)
+                if len(solutions) == 1:
+                    perm = solutions[0]
+                    target_person = r.choice(people)
+                    answer_slot = perm[people.index(target_person)]
+                    constraints = " ".join(cons_text)
+                    qtext = (
+                        f"Three people ({', '.join(people)}) need to be "
+                        f"assigned to three time slots (morning, "
+                        f"afternoon, evening), each person in exactly "
+                        f"one slot. Constraints: {constraints} Which "
+                        f"slot is {target_person} assigned to?"
+                    )
+                    options = list(slots)
+                    r.shuffle(options)
+                    gold_idx = options.index(answer_slot)
+                    out.append(_mc(qtext, options, gold_idx,
+                                   "procedural_reasoning/constraint_sat"))
+                    break
+            else:
+                # Fallback: no unique solution found in 20 tries —
+                # default to a deterministic example.
+                qtext = (
+                    f"Three people ({', '.join(people)}) need slots "
+                    f"morning/afternoon/evening, one each. Constraints: "
+                    f"{people[0]} is in the morning. {people[1]} is "
+                    f"earlier than {people[2]}. Which slot is "
+                    f"{people[2]} assigned to?"
+                )
+                options = list(slots)
+                r.shuffle(options)
+                gold_idx = options.index("evening")
+                out.append(_mc(qtext, options, gold_idx,
+                               "procedural_reasoning/constraint_sat"))
     return out
 
 
@@ -11061,38 +13202,76 @@ def _generate_mc_items(block_seed, n_items: int, *, max_letter: str = "D") -> li
         gold = ""
         category = "general"
         if kind == "arithmetic_mc":
-            arith_kind = r.choice(["multi_op", "percent", "fraction", "exponent"])
+            # 2026-05-02 (v30.5): harder. Was 4 sub-kinds (multi_op,
+            # percent, fraction, exponent), distractors at ±3-25.
+            # Now 6 sub-kinds adding chained_percent (compound) and
+            # weighted_avg, and distractors are tighter (±1-7) so
+            # near-correct answers don't count for free.
+            arith_kind = r.choice([
+                "multi_op", "percent", "fraction", "exponent",
+                "chained_percent", "weighted_avg",
+            ])
             if arith_kind == "multi_op":
                 a, b, c = r.randint(15, 90), r.randint(15, 90), r.randint(2, 19)
                 offset = r.randint(1, 99)
-                ans = (a + b) * c - offset
-                question = f"Compute ({a} + {b}) * {c} - {offset}."
+                d = r.randint(2, 9)
+                ans = ((a + b) * c - offset) // d
+                question = f"Compute (({a} + {b}) * {c} - {offset}) // {d} (integer division)."
             elif arith_kind == "percent":
-                base = r.choice([120, 150, 200, 240, 300, 400, 500])
-                pct = r.choice([15, 18, 22, 35, 45, 55, 65, 75])
+                base = r.choice([240, 300, 350, 420, 500, 640, 720, 800])
+                pct = r.choice([12, 17, 23, 27, 33, 41, 47, 58, 67])
                 ans = base * pct // 100
-                question = f"What is {pct}% of {base}? (Answer is an integer.)"
+                question = f"What is {pct}% of {base}? (Round down to an integer.)"
             elif arith_kind == "fraction":
                 num = r.randint(2, 9)
-                denom = r.choice([4, 5, 6, 8, 10])
-                whole = r.choice([60, 72, 80, 90, 120, 180])
+                denom = r.choice([3, 4, 5, 6, 7, 8, 9, 11])
+                whole = r.choice([60, 72, 84, 90, 120, 180, 252, 360])
                 while whole % denom != 0:
                     whole += 1
                 ans = (whole // denom) * num
                 question = f"Compute {num}/{denom} of {whole}."
-            else:  # exponent
-                base = r.randint(2, 6)
-                power = r.randint(3, 5)
-                add = r.randint(7, 41)
-                ans = base ** power + add
-                question = f"Compute {base}^{power} + {add}."
-            distractors = {ans + r.choice([-7, -3, 3, 7]),
-                           ans + r.randint(10, 25),
-                           ans - r.randint(10, 25)}
-            distractors.discard(ans)
-            distractors = list(distractors)[:3]
+            elif arith_kind == "exponent":
+                base = r.randint(2, 7)
+                power = r.randint(3, 6)
+                add = r.randint(7, 99)
+                mul = r.randint(2, 5)
+                ans = (base ** power + add) * mul
+                question = f"Compute ({base}^{power} + {add}) * {mul}."
+            elif arith_kind == "chained_percent":
+                base = r.choice([200, 300, 500, 800, 1000])
+                pct1 = r.choice([10, 20, 25, 30])
+                pct2 = r.choice([10, 15, 20, 25])
+                # Increase by pct1, then decrease by pct2.
+                after_inc = base + base * pct1 // 100
+                ans = after_inc - after_inc * pct2 // 100
+                question = (
+                    f"A value of {base} is increased by {pct1}%, then the "
+                    f"NEW value is decreased by {pct2}%. What is the final "
+                    f"integer value?"
+                )
+            else:  # weighted_avg
+                w1 = r.randint(2, 7)
+                v1 = r.randint(20, 80)
+                w2 = r.randint(3, 9)
+                v2 = r.randint(20, 80)
+                w3 = r.randint(2, 6)
+                v3 = r.randint(20, 80)
+                ans = (w1 * v1 + w2 * v2 + w3 * v3) // (w1 + w2 + w3)
+                question = (
+                    f"Compute the weighted average of {v1}, {v2}, and {v3} "
+                    f"with weights {w1}, {w2}, and {w3} respectively. "
+                    f"(Round down to an integer.)"
+                )
+            # Tighter distractors (±1-7) so near-correct answers don't pass.
+            distractors_set = set()
+            for off in r.sample([-1, 1, -2, 2, -3, 3, -5, 5, -7, 7], 6):
+                if ans + off != ans:
+                    distractors_set.add(ans + off)
+                if len(distractors_set) >= 3:
+                    break
+            distractors = list(distractors_set)[:3]
             while len(distractors) < 3:
-                distractors.append(ans + r.randint(30, 80))
+                distractors.append(ans + r.randint(8, 15))
             opts = [str(ans)] + [str(d) for d in distractors]
             r.shuffle(opts)
             gold = str(ans)
@@ -11323,14 +13502,26 @@ def _generate_ifeval_items(block_seed, n_items: int) -> list[dict]:
         "title_format",
         "bullet_list",
     ]
-    # v29: ~30 % compound items. We replace `compound` placeholders in
-    # the per-item loop below with two stacked constraints (chosen from
-    # a curated whitelist of non-conflicting pairs).
-    n_compound = max(0, (n_items * 30 + 50) // 100)
-    n_single = n_items - n_compound
+    # 2026-05-02 (v30.5): hardening. Was 30% compound (2-stack), now
+    # 60% compound split: 35% compound2 (2-stack) + 25% compound3
+    # (3-stack). Single-constraint tier drops to 40%. Held-out IFEval
+    # pass-rate already saturated at 0.85+ on v29; the 3-stack tier
+    # matches IFEval's "very compound" tail (4 % of items in the
+    # public set are 4-stack, but they're rare; 3-stack at 25 % is
+    # appropriately aggressive for a tightening pass).
+    n_compound3 = max(0, (n_items * 25 + 50) // 100)
+    n_compound2 = max(0, (n_items * 35 + 50) // 100)
+    n_single = max(1, n_items - n_compound2 - n_compound3)
+    # Re-balance if rounding cost us items
+    extra = n_items - (n_single + n_compound2 + n_compound3)
+    n_compound2 += extra
     single_pool = (kinds * ((n_single // len(kinds)) + 1))[:n_single]
     rng.shuffle(single_pool)
-    item_kinds = single_pool + ["compound"] * n_compound
+    item_kinds = (
+        single_pool
+        + ["compound"] * n_compound2
+        + ["compound3"] * n_compound3
+    )
     rng.shuffle(item_kinds)
     kinds = item_kinds  # consumed below as kinds[i % len(kinds)]
     rng.shuffle(kinds)
@@ -11545,6 +13736,94 @@ def _generate_ifeval_items(block_seed, n_items: int) -> list[dict]:
             instruction_ids = ii_a + ii_b
             kwargs_list = kk_a + kk_b
             kind = f"compound:{a}+{b}"
+        elif kind == "compound3":
+            # 2026-05-02 (v30.5): 3-stack compound. Curated triples
+            # of non-conflicting constraints across distinct verifier
+            # families (length / case / format / keyword / phrase) so
+            # no two constraints fight each other. The model must
+            # satisfy ALL three for the item to grade as ``ok``.
+            triple_options = [
+                ("min_words", "include_keyword", "ends_with_phrase"),
+                ("max_words", "no_comma", "all_lowercase"),
+                ("exact_sentences", "include_keyword", "title_format"),
+                ("min_words", "forbid_keyword", "ends_with_phrase"),
+                ("bullet_list", "include_keyword", "no_comma"),
+                ("title_format", "exact_sentences", "include_keyword"),
+                ("all_lowercase", "include_keyword", "no_comma"),
+                ("min_words", "all_lowercase", "ends_with_phrase"),
+                ("bullet_list", "min_words", "ends_with_phrase"),
+                ("title_format", "exact_sentences", "ends_with_phrase"),
+            ]
+            a, b, c = r.choice(triple_options)
+
+            def _build3(k_local: str):
+                ii: list[str] = []
+                kk: list[dict] = []
+                pp: str = ""
+                if k_local == "min_words":
+                    n_w = r.choice([40, 60, 80])
+                    pp = f"contain at least {n_w} words"
+                    ii = ["length_constraints:number_words"]
+                    kk = [{"num_words": n_w, "relation": "at least"}]
+                elif k_local == "max_words":
+                    n_w = r.choice([25, 35, 50])
+                    pp = f"contain no more than {n_w} words"
+                    ii = ["length_constraints:number_words"]
+                    kk = [{"num_words": n_w, "relation": "at most"}]
+                elif k_local == "exact_sentences":
+                    n_s = r.choice([3, 4, 5])
+                    pp = f"contain exactly {n_s} sentences"
+                    ii = ["length_constraints:number_sentences"]
+                    kk = [{"num_sentences": n_s, "relation": "exactly"}]
+                elif k_local == "all_lowercase":
+                    pp = "use only lowercase letters"
+                    ii = ["change_case:english_lowercase"]
+                    kk = [{}]
+                elif k_local == "no_comma":
+                    pp = "contain no commas"
+                    ii = ["punctuation:no_comma"]
+                    kk = [{}]
+                elif k_local == "ends_with_phrase":
+                    phrase = r.choice([
+                        "Is there anything else I can help with?",
+                        "Thank you for reading.",
+                        "End of report.",
+                    ])
+                    pp = f"end with the exact phrase {phrase!r}"
+                    ii = ["startend:end_checker"]
+                    kk = [{"end_phrase": phrase}]
+                elif k_local == "include_keyword":
+                    n_k = r.randint(2, 4)
+                    pp = f"include the word {keyword!r} at least {n_k} times"
+                    ii = ["keywords:frequency"]
+                    kk = [{"keyword": keyword, "relation": "at least", "frequency": n_k}]
+                elif k_local == "forbid_keyword":
+                    forbidden = r.choice([n_ for n_ in nouns if n_ != keyword])
+                    pp = f"never use the word {forbidden!r}"
+                    ii = ["keywords:forbidden_words"]
+                    kk = [{"forbidden_words": [forbidden]}]
+                elif k_local == "bullet_list":
+                    n_b = r.randint(3, 5)
+                    pp = f"include exactly {n_b} markdown bullet points (lines starting with `* ` or `- `)"
+                    ii = ["detectable_format:number_bullet_lists"]
+                    kk = [{"num_bullets": n_b}]
+                elif k_local == "title_format":
+                    pp = "begin with a title wrapped in double angle brackets like ``<<Title Goes Here>>`` on the first line"
+                    ii = ["detectable_format:title"]
+                    kk = [{}]
+                return ii, kk, pp
+
+            ii_a, kk_a, pp_a = _build3(a)
+            ii_b, kk_b, pp_b = _build3(b)
+            ii_c, kk_c, pp_c = _build3(c)
+            prompt = (
+                f"Write a short response about {topic}. Your response must "
+                f"satisfy ALL of the following constraints simultaneously: "
+                f"(1) {pp_a}; (2) {pp_b}; (3) {pp_c}."
+            )
+            instruction_ids = ii_a + ii_b + ii_c
+            kwargs_list = kk_a + kk_b + kk_c
+            kind = f"compound3:{a}+{b}+{c}"
         out.append({
             "src": f"procedural_ifeval/{kind}",
             "prompt": prompt,
@@ -12079,135 +14358,7 @@ def robustness_bench_probe(model, tokenizer, device="cuda"):
 # arithmetic operators. The math is the same; we only perturb the
 # narrative/instructional text around it. Otherwise we'd be changing
 # the answer, not testing surface-noise robustness.
-def _noise_safe_letter_swap(text: str, rate: float, rng_seed: int) -> str:
-    """Substitute alpha chars with adjacent QWERTY keys at ``rate``.
-
-    Skips digits, punctuation, whitespace, and non-ASCII. Bounded so
-    we never mangle the actual numerical content of a math problem.
-    """
-    import random
-    rng = random.Random(rng_seed)
-    qwerty = {
-        "q": "wa", "w": "qes", "e": "wrd", "r": "etf", "t": "ryg",
-        "y": "tuh", "u": "yij", "i": "uok", "o": "ipl", "p": "o",
-        "a": "qsz", "s": "awdz", "d": "sefx", "f": "drgc", "g": "fthv",
-        "h": "gybn", "j": "hkun", "k": "jlim", "l": "ko",
-        "z": "asx", "x": "zsdc", "c": "xdfv", "v": "cfgb", "b": "vghn",
-        "n": "bhjm", "m": "njk",
-    }
-    out_chars = []
-    for ch in text:
-        if ch.isalpha() and ch.isascii() and rng.random() < rate:
-            low = ch.lower()
-            if low in qwerty:
-                sub = rng.choice(qwerty[low])
-                out_chars.append(sub.upper() if ch.isupper() else sub)
-                continue
-        out_chars.append(ch)
-    return "".join(out_chars)
-
-
-def _noise_case_jitter(text: str, rate: float, rng_seed: int) -> str:
-    import random
-    rng = random.Random(rng_seed)
-    return "".join(
-        (ch.swapcase() if ch.isalpha() and ch.isascii() and rng.random() < rate else ch)
-        for ch in text
-    )
-
-
-def _noise_extra_whitespace(text: str, rng_seed: int) -> str:
-    """Replace some single spaces with 2-3 spaces, sprinkle a few blank lines."""
-    import random
-    rng = random.Random(rng_seed)
-    out = []
-    for ch in text:
-        if ch == " " and rng.random() < 0.10:
-            out.append(" " * rng.randint(2, 3))
-        elif ch == "\n" and rng.random() < 0.15:
-            out.append("\n\n")
-        else:
-            out.append(ch)
-    return "".join(out)
-
-
-def _noise_common_misspellings(text: str) -> str:
-    """Apply common chat-typo replacements on whole-word boundaries."""
-    import re
-    table = [
-        (r"\bthe\b", "teh"),
-        (r"\byour\b", "youre"),
-        (r"\bbecause\b", "becuase"),
-        (r"\bdefinitely\b", "definately"),
-        (r"\bseparate\b", "seperate"),
-        (r"\bachieve\b", "acheive"),
-        (r"\boccur\b", "occure"),
-        (r"\bweird\b", "wierd"),
-        (r"\breceive\b", "recieve"),
-    ]
-    for pat, rep in table:
-        text = re.sub(pat, rep, text, flags=re.IGNORECASE)
-    return text
-
-
-def _noise_drop_sentence_periods(text: str, rng_seed: int) -> str:
-    """Drop ~50% of sentence-ending periods; never touch decimal points.
-
-    A decimal point is a period flanked by digits (e.g. ``3.14``); we
-    only drop periods followed by whitespace, end-of-string, or a
-    capital letter (sentence-end). Question marks are left alone so
-    the question semantics are preserved.
-    """
-    import random
-    import re
-    rng = random.Random(rng_seed)
-
-    def _maybe_drop(m):
-        return "" if rng.random() < 0.5 else m.group(0)
-
-    return re.sub(r"\.(?=\s|$|[A-Z])", _maybe_drop, text)
-
-
-_NOISE_PERTURBATION_TEMPLATES: tuple[tuple[str, "callable[[str, int], str]"], ...] = (
-    (
-        "light_typos",
-        lambda p, s: _noise_safe_letter_swap(p, rate=0.025, rng_seed=s),
-    ),
-    (
-        "case_jitter",
-        lambda p, s: _noise_case_jitter(p, rate=0.04, rng_seed=s),
-    ),
-    (
-        "chatter_prefix",
-        lambda p, s: (
-            "Hey! I'm working through some practice problems — "
-            "could you take a look at this one?\n\n" + p
-        ),
-    ),
-    (
-        "chatter_suffix",
-        lambda p, s: p.rstrip() + "\n\nThanks in advance, really appreciate it!",
-    ),
-    (
-        "extra_whitespace",
-        lambda p, s: _noise_extra_whitespace(p, rng_seed=s),
-    ),
-    (
-        "common_misspellings",
-        lambda p, s: _noise_common_misspellings(p),
-    ),
-    (
-        "drop_periods",
-        lambda p, s: _noise_drop_sentence_periods(p, rng_seed=s),
-    ),
-    (
-        "polite_distractor",
-        lambda p, s: (
-            "(My cat just walked across the keyboard, sorry if anything "
-            "looks weird.)\n\n" + p
-        ),
-    ),
-)
+_NOISE_PERTURBATION_TEMPLATES = NOISE_PERTURBATION_TEMPLATES
 
 
 def _pick_noise_perturbations(
@@ -12476,7 +14627,8 @@ def long_context_bench_probe(model, tokenizer, device="cuda"):
     return out
 
 
-def run_bench_battery(model, tokenizer, device="cuda"):
+def run_bench_battery(model, tokenizer, device="cuda",
+                       stage_callback=None):
     """Run all bench probes for one student. Returns a dict keyed by axis
     name (``math_bench`` / ``code_bench`` / ... / ``aime_bench`` / etc.).
     Each value is a dict with ``n``, ``correct``, ``pass_frac``, ``items``,
@@ -12487,6 +14639,15 @@ def run_bench_battery(model, tokenizer, device="cuda"):
     outage in the Session 3 (shadow) tail can't corrupt the production
     numbers. Each probe is wrapped so a single failure doesn't abort the
     battery.
+
+    2026-05-04 — ``stage_callback`` is an optional ``f(name, idx, total)``
+    invoked before each probe. The dispatcher uses this to update
+    ``current.stage`` in ``eval_progress.json`` so the dashboard shows
+    "running aime_bench (6/17)" instead of a single static "bench_battery"
+    label for the entire ~25-min phase. Per-axis logging also lands in
+    the pod log so we can tell from a glance which axis is the wall-time
+    sink for each student (key for the ongoing eager-attn-vs-FA2 perf
+    investigation).
     """
     if not BENCH_BATTERY_ENABLED:
         return {}
@@ -12532,6 +14693,23 @@ def run_bench_battery(model, tokenizer, device="cuda"):
         # v30 — pragmatic reasoning (theory-of-mind, scalar
         # implicature, indirect-request recognition).
         ("pragmatic_bench", pragmatic_bench_probe),
+        # v31 procedural axes (PRODUCTION 2026-05-09). The full 11-
+        # axis surface, each carrying a non-zero composite weight per
+        # V31_AXIS_WEIGHTS in composite.py. Probes short-circuit to
+        # n=0 when their PER_ROUND env knob is 0 (axis-level disable
+        # without code change). See reports/2026-05-09-v31-axis-
+        # promotion.md for the per-axis weight rationale.
+        ("v31_math_gsm_symbolic", v31_gsm_symbolic_bench_probe),
+        ("v31_math_competition", v31_math_competition_bench_probe),
+        ("v31_math_robustness", v31_math_robustness_bench_probe),
+        ("v31_code_humaneval_plus", v31_code_humaneval_plus_bench_probe),
+        ("v31_reasoning_logic_grid", v31_reasoning_logic_grid_bench_probe),
+        ("v31_reasoning_dyval_arith", v31_reasoning_dyval_arith_bench_probe),
+        ("v31_long_context_ruler", v31_long_context_ruler_bench_probe),
+        ("v31_knowledge_multi_hop_kg", v31_knowledge_multi_hop_kg_bench_probe),
+        ("v31_ifeval_verifiable", v31_ifeval_verifiable_bench_probe),
+        ("v31_truthfulness_calibration", v31_truthfulness_calibration_bench_probe),
+        ("v31_consistency_paraphrase", v31_consistency_paraphrase_bench_probe),
     )
     _probes = _live_probes + (_shadow_probes if BENCH_BATTERY_SHADOW_AXES else ())
     if not BENCH_BATTERY_SHADOW_AXES:
@@ -12544,7 +14722,13 @@ def run_bench_battery(model, tokenizer, device="cuda"):
                 "n": 0, "correct": 0, "pass_frac": 0.0, "wall_s": 0.0,
                 "_skipped": True,
             }
-    for name, fn in _probes:
+    total = len(_probes)
+    for idx, (name, fn) in enumerate(_probes, start=1):
+        if stage_callback is not None:
+            try:
+                stage_callback(name, idx, total)
+            except Exception:
+                pass
         st = time.time()
         try:
             res = fn(model, tokenizer, device)
@@ -12552,6 +14736,16 @@ def run_bench_battery(model, tokenizer, device="cuda"):
             res = {"error": str(e)[:200], "n": 0, "correct": 0, "pass_frac": 0.0}
         res["wall_s"] = round(time.time() - st, 1)
         out[name] = res
+        n_done = res.get("n", 0) or 0
+        n_correct = res.get("correct", 0) or 0
+        err = res.get("error")
+        if err:
+            print(f"  [bench {idx}/{total}] {name}: ERROR {err[:80]} ({res['wall_s']:.1f}s)", flush=True)
+        elif n_done > 0:
+            pf = (n_correct / n_done) if n_done else 0.0
+            print(f"  [bench {idx}/{total}] {name}: {n_correct}/{n_done} ({pf*100:.0f}%) ({res['wall_s']:.1f}s)", flush=True)
+        else:
+            print(f"  [bench {idx}/{total}] {name}: skipped/empty ({res['wall_s']:.1f}s)", flush=True)
     out["_total_wall_s"] = round(time.time() - t0, 1)
     out["_shadow_axes_enabled"] = BENCH_BATTERY_SHADOW_AXES
     return out
@@ -12572,9 +14766,8 @@ def prepare_teacher_probe_refs_hf(teacher, tokenizer, device="cuda", block_seed=
     The chat-probe teacher pass is new (2026-04-22): the composite ``length``
     axis needs a teacher-side length anchor to normalize student rambling
     against. Previously it relied on ``_TEACHER_PROBE_SAMPLES`` (think
-    probe), which is empty when ``THINK_COLLAPSE_PROBE=0`` (the default
-    after the 2026-04-19 miscalibration outage). Running the teacher on
-    the four trivial CHAT_PROBE_PROMPTS gives us an always-available
+    probe), which can be empty when ``THINK_COLLAPSE_PROBE=0``. Running
+    the teacher on the four trivial CHAT_PROBE_PROMPTS gives us an always-available
     anchor — ``enable_thinking=False`` + 48 tokens each ≈ 200 tokens total
     teacher work, negligible next to the ~300-prompt scoring pass.
     """
@@ -12586,19 +14779,9 @@ def prepare_teacher_probe_refs_hf(teacher, tokenizer, device="cuda", block_seed=
         return think_samples, cap_answers, cap_gen_lens, chat_gen_lens
     think_prompts = _pick_think_probe_prompts(block_seed)
     try:
-        eos_ids = []
-        for tok in ["<|im_end|>", "<|endoftext|>"]:
-            tid = tokenizer.convert_tokens_to_ids(tok)
-            if isinstance(tid, int) and tid >= 0:
-                eos_ids.append(tid)
-        if getattr(tokenizer, "eos_token_id", None) is not None:
-            eos_ids.append(int(tokenizer.eos_token_id))
-        eos_ids = list(set(eos_ids)) or None
-        pad_id = getattr(tokenizer, "pad_token_id", None) or (eos_ids[0] if eos_ids else 0)
+        eos_ids, pad_id = _eos_pad_ids(tokenizer)
 
-        was_training = teacher.training
-        teacher.eval()
-        with torch.no_grad():
+        with _model_eval_no_grad(teacher):
             for prompt in think_prompts:
                 try:
                     rendered = _render_chat_prompt(tokenizer, prompt, enable_thinking=True)
@@ -12649,8 +14832,6 @@ def prepare_teacher_probe_refs_hf(teacher, tokenizer, device="cuda", block_seed=
                     chat_gen_lens.append(int(new_ids.shape[0]))
                 except Exception as e:
                     print(f"[eval] Teacher chat-probe prompt failed: {e}", flush=True)
-        if was_training:
-            teacher.train()
     except Exception as e:
         print(f"[eval] prepare_teacher_probe_refs_hf error: {e}", flush=True)
     return think_samples, cap_answers, cap_gen_lens, chat_gen_lens
@@ -12771,6 +14952,123 @@ def prepare_teacher_probe_refs_vllm(tokenizer, block_seed=None, concurrency=16):
                 chat_gen_lens[idx] = glen
     except Exception as e:
         print(f"[eval] prepare_teacher_probe_refs_vllm error: {e}", flush=True)
+    return think_samples, cap_answers, cap_gen_lens, chat_gen_lens
+
+
+def prepare_teacher_probe_refs_api(tokenizer, api_cfg, block_seed=None, concurrency=None):
+    """Cloud-API equivalent of :func:`prepare_teacher_probe_refs_vllm`.
+
+    Same ``(think_samples, cap_answers, cap_gen_lens, chat_gen_lens)``
+    return tuple. Greedy text-only — no logprobs needed for probe refs.
+
+    Why we still render the chat template locally (rather than letting
+    the API render it): we want bit-identical prompts to those the local
+    vLLM path produced for our existing baselines and cached probes. The
+    teacher is a single MoE behind both providers, so feeding it the
+    pre-rendered prompt via either ``/v1/chat/completions`` (with the
+    rendered text as a single user message) or ``/v1/completions`` (raw
+    prompt) reproduces the same generation. Chat-endpoint providers will
+    apply *another* template wrap on top, which is still deterministic
+    and reproducible across rounds.
+    """
+    # ``pod_eval_vllm`` runs both as a script (``python pod_eval_vllm.py``)
+    # and as a module (``python -m scripts.pod_eval_vllm``). Try a package
+    # import first; if we're a script, fall back to sys.path-relative.
+    try:
+        from scripts.api_teacher import _greedy_text_one  # type: ignore
+    except ImportError:
+        import os as _os
+        import sys as _sys
+        _here = _os.path.dirname(_os.path.abspath(__file__))
+        if _here not in _sys.path:
+            _sys.path.insert(0, _here)
+        from api_teacher import _greedy_text_one  # type: ignore
+
+    think_samples = []
+    cap_answers = []
+    cap_gen_lens = []
+    chat_gen_lens = []
+    if tokenizer is None:
+        return think_samples, cap_answers, cap_gen_lens, chat_gen_lens
+    # 2026-05-04: probe concurrency defaults to ~half the api_cfg.concurrency
+    # because Phase 1 ran sustained at api_cfg.concurrency for ~9 min, leaving
+    # the Inceptron rate bucket warm. Bursting the probes at the same level
+    # immediately tripped 429 storms (~30 consecutive failures observed in
+    # epoch 2). Halving the concurrency for probes (min 1) keeps the burst
+    # within the per-second budget while the bucket recovers, and the probe
+    # batches are short enough that wall-clock impact is negligible.
+    if concurrency is None:
+        concurrency = max(1, getattr(api_cfg, "concurrency", 4) // 2)
+    think_prompts = _pick_think_probe_prompts(block_seed)
+
+    def _post(rendered, max_tokens):
+        return _greedy_text_one(rendered, api_cfg, max_tokens, idx=0)
+
+    def _do_think(idx_prompt):
+        idx, prompt = idx_prompt
+        try:
+            rendered = _render_chat_prompt(tokenizer, prompt, enable_thinking=True)
+            return idx, _post(rendered, THINK_PROBE_MAX_TOKENS), None
+        except Exception as e:
+            return idx, "", e
+
+    def _do_cap(idx_item):
+        idx, item = idx_item
+        try:
+            rendered = _render_chat_prompt(tokenizer, item["q"], enable_thinking=False)
+            txt = _post(rendered, CAPABILITY_PROBE_MAX_TOKENS)
+            try:
+                gen_len = len(tokenizer(txt, return_tensors="pt").input_ids[0])
+            except Exception:
+                gen_len = 0
+            return idx, _extract_capability_answer(txt, item["kind"]), gen_len, None
+        except Exception as e:
+            return idx, "", 0, e
+
+    def _do_chat(idx_prompt):
+        idx, prompt = idx_prompt
+        try:
+            rendered = _render_chat_prompt(tokenizer, prompt, enable_thinking=False)
+            txt = _post(rendered, CHAT_PROBE_MAX_TOKENS)
+            try:
+                gen_len = len(
+                    tokenizer(txt, return_tensors="pt", truncation=False).input_ids[0]
+                )
+            except Exception:
+                gen_len = 0
+            return idx, gen_len, None
+        except Exception as e:
+            return idx, 0, e
+
+    try:
+        think_samples = [""] * len(think_prompts)
+        with ThreadPoolExecutor(max_workers=min(concurrency, max(1, len(think_prompts)))) as ex:
+            for idx, txt, err in ex.map(_do_think, list(enumerate(think_prompts))):
+                if err is not None:
+                    print(f"[eval] API teacher think-probe failed: {err}", flush=True)
+                think_samples[idx] = txt
+
+        cap_answers = [""] * len(CAPABILITY_PROBE_PROMPTS)
+        cap_gen_lens = [0] * len(CAPABILITY_PROBE_PROMPTS)
+        with ThreadPoolExecutor(
+            max_workers=min(concurrency, max(1, len(CAPABILITY_PROBE_PROMPTS)))
+        ) as ex:
+            for idx, ans, glen, err in ex.map(_do_cap, list(enumerate(CAPABILITY_PROBE_PROMPTS))):
+                if err is not None:
+                    print(f"[eval] API teacher capability failed: {err}", flush=True)
+                cap_answers[idx] = ans
+                cap_gen_lens[idx] = glen
+
+        chat_gen_lens = [0] * len(CHAT_PROBE_PROMPTS)
+        with ThreadPoolExecutor(
+            max_workers=min(concurrency, max(1, len(CHAT_PROBE_PROMPTS)))
+        ) as ex:
+            for idx, glen, err in ex.map(_do_chat, list(enumerate(CHAT_PROBE_PROMPTS))):
+                if err is not None:
+                    print(f"[eval] API teacher chat-probe failed: {err}", flush=True)
+                chat_gen_lens[idx] = glen
+    except Exception as e:
+        print(f"[eval] prepare_teacher_probe_refs_api error: {e}", flush=True)
     return think_samples, cap_answers, cap_gen_lens, chat_gen_lens
 
 
@@ -13036,17 +15334,7 @@ def on_policy_rollouts(student, tokenizer, device="cuda",
     if not getattr(tokenizer, "chat_template", None):
         return rollouts
 
-    eos_ids = []
-    for t in ("<|im_end|>", "<|endoftext|>"):
-        i = tokenizer.convert_tokens_to_ids(t)
-        if isinstance(i, int) and i >= 0:
-            eos_ids.append(i)
-    if getattr(tokenizer, "eos_token_id", None) is not None:
-        eos_ids.append(int(tokenizer.eos_token_id))
-    eos_ids = list(set(eos_ids)) or None
-    pad_id = getattr(tokenizer, "pad_token_id", None)
-    if pad_id is None:
-        pad_id = eos_ids[0] if eos_ids else 0
+    eos_ids, pad_id = _eos_pad_ids(tokenizer)
 
     was_training = student.training
     student.eval()
@@ -13946,8 +16234,42 @@ def _stub_missing_preprocessor_config(model_name, revision=None):
     # one for them.
     if "vision_config" not in cfg:
         return
-    # Minimal Qwen2-VL-shape image processor config. Values aren't used
-    # at inference because mm is disabled via --limit-mm-per-prompt.
+
+    model_type = (cfg.get("model_type") or "").lower()
+
+    # Kimi K2.5/K2.6 family: vLLM's kimi_k25 model integration accesses
+    # ``image_processor.media_tokens_calculator`` at engine init. The
+    # generic Qwen2-VL stub silently produces a Qwen2VLImageProcessor
+    # which lacks that attribute and crashes the engine with
+    #   AttributeError: 'Qwen2VLImageProcessor' object has no attribute
+    #   'media_tokens_calculator'
+    # Kimi K2.6 ships its own image processor class
+    # (``KimiK25VisionProcessor`` in ``kimi_k25_vision_processing.py``)
+    # that does have that attribute. Stub a config that points
+    # transformers + trust_remote_code at THAT class instead.
+    if model_type in {"kimi_k25", "kimi_k2"}:
+        stub = {
+            "image_processor_type": "KimiK25VisionProcessor",
+            "processor_class": "KimiK25Processor",
+            "auto_map": {
+                "AutoImageProcessor": "kimi_k25_vision_processing.KimiK25VisionProcessor",
+                "AutoProcessor": "kimi_k25_processor.KimiK25Processor",
+            },
+        }
+        try:
+            pp_path.write_text(_json.dumps(stub, indent=2))
+            print(
+                f"[vllm] Stubbed Kimi-aware preprocessor_config.json at {pp_path} "
+                f"(image_processor_type=KimiK25VisionProcessor)",
+                flush=True,
+            )
+        except Exception as e:
+            print(f"[vllm] Failed to write Kimi preprocessor stub: {e}", flush=True)
+        return
+
+    # Default: minimal Qwen2-VL-shape image processor config. Values
+    # aren't used at inference because mm is disabled via
+    # --limit-mm-per-prompt.
     stub = {
         "image_processor_type": "Qwen2VLImageProcessor",
         "min_pixels": 3136,
@@ -14033,7 +16355,81 @@ def _teacher_cache_complete(model_name, revision=None):
     return True
 
 
-def start_vllm_server(model_name, gpu_memory_utilization=0.90, max_model_len=16384, revision=None, tensor_parallel_size=1, _attempt=1):
+def _gpu_total_gb() -> float:
+    """Return GPU 0 total memory in GiB. Used to compute absolute headroom
+    for vLLM restart-after-crash without baking in H200 specifics."""
+    try:
+        import subprocess
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=memory.total",
+             "--format=csv,noheader,nounits", "-i", "0"],
+            text=True, timeout=5,
+        ).strip()
+        return float(out) / 1024.0
+    except Exception:
+        return 140.0  # H200 fallback
+
+
+def _gpu_free_gb() -> float:
+    """Return GPU 0 free memory in GiB."""
+    try:
+        import subprocess
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=memory.free",
+             "--format=csv,noheader,nounits", "-i", "0"],
+            text=True, timeout=5,
+        ).strip()
+        return float(out) / 1024.0
+    except Exception:
+        return 0.0
+
+
+def _wait_for_gpu_memory_free(min_free_gb: float, timeout_s: int = 60) -> bool:
+    """Poll nvidia-smi until at least ``min_free_gb`` of GPU 0 memory is
+    free, or ``timeout_s`` elapses. Returns True if the threshold was met.
+
+    Used to gate vLLM restart after a crash: the dead EngineCore
+    subprocess takes 10-30s to actually release its KV-cache allocation
+    even after the parent API server has been killed. Without this
+    wait, vLLM startup fails with::
+
+        ValueError: Free memory on device cuda:0 (116.47/139.8 GiB) on
+        startup is less than desired GPU memory utilization (0.85,
+        118.83 GiB).
+    """
+    import time
+    deadline = time.time() + timeout_s
+    last_print = 0.0
+    while time.time() < deadline:
+        free = _gpu_free_gb()
+        now = time.time()
+        if free >= min_free_gb:
+            print(
+                f"  [vllm] GPU has {free:.1f} GiB free "
+                f"(needed {min_free_gb:.1f}); proceeding",
+                flush=True,
+            )
+            return True
+        if now - last_print > 5.0:
+            print(
+                f"  [vllm] waiting for GPU memory: free={free:.1f} GiB, "
+                f"need >={min_free_gb:.1f} GiB "
+                f"({int(deadline - now)}s left)",
+                flush=True,
+            )
+            last_print = now
+        time.sleep(2)
+    free = _gpu_free_gb()
+    print(
+        f"  [vllm] GPU memory wait timed out after {timeout_s}s "
+        f"(free={free:.1f} GiB, needed {min_free_gb:.1f}). "
+        f"Proceeding anyway — vLLM startup may still fail.",
+        flush=True,
+    )
+    return False
+
+
+def start_vllm_server(model_name, gpu_memory_utilization=0.90, max_model_len=8192, revision=None, tensor_parallel_size=1, _attempt=1):
     """Start vLLM server via subprocess. Returns True on success. Retries once on crash."""
     ensure_disk_space(model_name, threshold=80)
 
@@ -14070,6 +16466,34 @@ def start_vllm_server(model_name, gpu_memory_utilization=0.90, max_model_len=163
     except Exception as e:
         print(f"[vllm] preprocessor stub failed (non-fatal): {e}", flush=True)
 
+    # 2026-04-30 (v30.3.2): cap concurrent KV-cache slots to prevent the
+    # crash-loop we saw on Qwen3.6-35B-A3B at 48-way concurrency on a
+    # single H200 (140GB). vLLM v0.6+ "AsyncEngineDeadError" / port-9100
+    # connection-refused mid-eval is the symptom of KV-cache thrashing
+    # when (concurrent_seqs × per-seq KV) ≥ available VRAM minus weights.
+    # 70GB weights + 0.85 util on 140GB = 49GB for KV, which fits ~32
+    # concurrent 4k-token streams comfortably. We size max_num_seqs to
+    # this budget so vLLM queues the rest internally instead of OOM-ing.
+    # Override via DISTIL_VLLM_MAX_NUM_SEQS for tuning.
+    max_num_seqs = int(os.environ.get("DISTIL_VLLM_MAX_NUM_SEQS", "32") or 32)
+    # The default util is 0.65 (left over from earlier T4/A100 tests).
+    # On H200 / multi-GPU pods we have headroom — bump the floor so the
+    # KV cache actually has room.
+    #
+    # 2026-05-01 (v30.3.5): lowered from 0.85 → 0.78. The pod is
+    # co-tenant with the chat-king vLLM (held at 0.15 = ~21 GiB on the
+    # H200) AND a dead EngineCore from a prior crash leaks 2-3 GiB for
+    # 10-30s before nvidia-smi reclaims it. At 0.85 util the restart
+    # path was hitting "Free memory ... is less than desired GPU
+    # memory utilization (0.85, 118.83 GiB)" and falling back to HF
+    # for the rest of the round. 0.78 leaves ~10 GiB of headroom and
+    # has not impacted KV-cache size in observed rounds (KV cache
+    # usage stays <5% during teacher gen).
+    #
+    # 2026-05-03 (v30.3.6): lowered 0.78 → 0.65. Chat-king grew to
+    # ~44 GiB; 0.78 * 139.8 = 109 GiB > 95.5 GiB free → crash.
+    if gpu_memory_utilization is None or gpu_memory_utilization < 0.5:
+        gpu_memory_utilization = 0.65
     cmd = [
         "python3", "-m", "vllm.entrypoints.openai.api_server",
         "--model", model_name,
@@ -14079,9 +16503,27 @@ def start_vllm_server(model_name, gpu_memory_utilization=0.90, max_model_len=163
         "--dtype", "bfloat16",
         "--gpu-memory-utilization", str(gpu_memory_utilization),
         "--max-model-len", str(max_model_len),
-        "--enable-prefix-caching",
+        "--max-num-seqs", str(max_num_seqs),
+        # 2026-04-30 (v30.3.3): prefix-caching DISABLED.
+        # Qwen3.6-35B-A3B uses Mamba/SSM layers (hybrid arch), and
+        # vLLM 0.19.1 prints this warning at startup:
+        #   "Prefix caching in Mamba cache 'align' mode is currently
+        #    enabled. Its support for Mamba layers is experimental.
+        #    Please report any issues you may observe."
+        # The "issue we observed" was: vLLM teacher dies cleanly after
+        # ~140 prompts (no OOM, KV cache <5%), the EngineCore
+        # subprocess exits with the leaked-semaphore signature,
+        # ConnectionError swarm hits the API server, and the eval
+        # falls back to HF. Disabling prefix-caching removes the
+        # experimental Mamba code path entirely. We lose a small
+        # amount of throughput on shared-prefix prompts (system
+        # prompts, ~5-10% of input tokens) but gain reliability.
+        # Re-enable after vLLM stabilises Mamba prefix-caching, or
+        # if we move back to a non-Mamba teacher.
+        # Chunked prefill kept on — it's orthogonal to prefix caching
+        # and is stable on Mamba per vLLM 0.19.1 release notes.
+        "--enable-chunked-prefill",
         "--no-enable-log-requests",
-        "--reasoning-parser", "qwen3",
         "--max-logprobs", "128",
         # 2026-04-29 (v29.7): Qwen3.6+ ships with a vision encoder
         # (multimodal MoE). We only ever use the teacher for text-only
@@ -14093,17 +16535,78 @@ def start_vllm_server(model_name, gpu_memory_utilization=0.90, max_model_len=163
         "--limit-mm-per-prompt", '{"image": 0, "video": 0}',
         "--skip-mm-profiling",
     ]
+    # 2026-05-03 (Kimi K2.6 cutover follow-up): vLLM 0.20.0's Kimi
+    # multimodal wrapper crashes during encoder-budget profiling on
+    # transformers >=5.0 because Kimi's bundled processor can't be loaded
+    # (preprocessor_config falls back to Qwen2VLImageProcessor which
+    # lacks Kimi-specific attrs). ``--enforce-eager`` skips the cuda-graph
+    # capture path that triggers some of that profiling, and combined
+    # with the in-place patches in eval/pod.py:ensure_dependencies()
+    # (``_distil_mm_tolerant`` + ``_distil_dummy_mm_tolerant``) lets
+    # Kimi K2.6 boot under vLLM. Harmless on text-only teachers (Qwen3.5
+    # / DeepSeek V3) — eager mode is ~5% slower than cuda-graph but our
+    # round wall-clock budget already absorbs that.
+    if "kimi" in (model_name or "").lower():
+        cmd.append("--enforce-eager")
+    # Teacher-family-specific reasoning parser. Qwen 3.x uses the ``qwen3``
+    # parser; Kimi K2.x has no dedicated reasoning parser in vLLM yet (its
+    # chat template emits tool tokens directly, no <think> blocks to
+    # strip), so we omit ``--reasoning-parser`` for Kimi teachers. If a
+    # future teacher needs a specific parser, plumb it through via env.
+    _parser_env = os.environ.get("DISTIL_VLLM_REASONING_PARSER")
+    if _parser_env and _parser_env not in ("", "none", "off"):
+        cmd.extend(["--reasoning-parser", _parser_env])
+    else:
+        _lc_model = (model_name or "").lower()
+        if ("qwen3" in _lc_model) and ("kimi" not in _lc_model) and ("deepseek" not in _lc_model):
+            cmd.extend(["--reasoning-parser", "qwen3"])
     if tensor_parallel_size and tensor_parallel_size > 1:
         cmd.extend(["--tensor-parallel-size", str(tensor_parallel_size)])
     if revision and revision != "main":
         cmd.extend(["--revision", revision])
 
+    # 2026-05-03 (Kimi K2.6 cutover follow-up): keep the previous attempt's
+    # vllm_teacher.log alongside the new one so we can see the *actual* root
+    # cause across attempts. Each attempt overwrites the live log; without
+    # this rotation the first attempt's traceback was lost as soon as
+    # attempt 2 truncated the file, leaving only the wrapper traceback in
+    # the eval_output.log tail and no way to see what the engine core
+    # actually died from.
+    try:
+        prev = Path("/tmp/vllm_teacher.log")
+        if prev.exists() and prev.stat().st_size > 0:
+            shutil.copy2(prev, f"/tmp/vllm_teacher.attempt{_attempt - 1 if _attempt > 1 else 0}.log")
+    except Exception:
+        pass
     log_f = open("/tmp/vllm_teacher.log", "w")
     env = os.environ.copy()
     env["VLLM_ATTENTION_BACKEND"] = "FLASH_ATTN"
     if offline_ok:
         env["HF_HUB_OFFLINE"] = "1"
         env["TRANSFORMERS_OFFLINE"] = "1"
+    # 2026-05-03 (Kimi K2.6 cutover follow-up): vLLM 0.20.0 ships a
+    # vendored ``vllm.third_party.deep_gemm`` whose Python files import OK
+    # (so ``has_deep_gemm()`` returns True) but whose compiled CUDA kernels
+    # are not actually loadable, leaving ``_get_mk_alignment_for_contiguous_layout_impl``
+    # set to None. Combined with the kernel_warmup gate
+    # ``do_deep_gemm_warmup = VLLM_USE_DEEP_GEMM and is_deep_gemm_supported()``
+    # — which short-circuits to True because the vendored module satisfies
+    # ``has_deep_gemm()`` — every Kimi-family worker hits ``_missing()`` in
+    # ``_fp8_linear_may_use_deep_gemm`` and dies with
+    # ``RuntimeError: DeepGEMM backend is not available or outdated`` during
+    # ``compile_or_warm_up_model``. All 8 TP workers die at the same time;
+    # APIServer reports the wrapper as ``Engine core initialization failed.
+    # Failed core proc(s): {}`` with no further detail. Setting the env vars
+    # below disables every DeepGEMM code path (warmup + runtime + E8M0)
+    # so vLLM falls back to Marlin/Triton kernels, which work for our
+    # quantised Kimi K2.6 teacher (it's W4A16 compressed-tensors / Marlin
+    # MoE, not FP8 — so we lose nothing by disabling the FP8 deep_gemm
+    # path). Re-evaluate after vLLM ships a fix or after we install a
+    # working external ``deep_gemm`` build.
+    env["VLLM_USE_DEEP_GEMM"] = "0"
+    env["VLLM_MOE_USE_DEEP_GEMM"] = "0"
+    env["VLLM_USE_DEEP_GEMM_E8M0"] = "0"
+    env["VLLM_DEEP_GEMM_WARMUP"] = "skip"
     proc = subprocess.Popen(cmd, stdout=log_f, stderr=subprocess.STDOUT, preexec_fn=os.setsid, env=env)
     Path("/tmp/vllm_teacher.pid").write_text(str(proc.pid))
     print(f"[vllm] PID: {proc.pid}", flush=True)
@@ -14533,17 +17036,28 @@ def generate_via_vllm(prompts, tokenizer, max_new_tokens, block_seed=None,
                 else:
                     print(f"  [vllm] Prompt {orig_idx} failed: {e}", flush=True)
 
-    # 2026-04-29 (v29.7): if the dead-event fired, the vLLM server crashed
-    # mid-eval. Bail loud and fast so the caller falls back to HF for the
-    # whole eval rather than thrashing on a dead server. Without this we
-    # spent ~45 min last round retrying connection-refused before giving up.
+    # 2026-04-30 (v30.3.4): if the dead-event fired, return partial
+    # results PLUS the list of failed indices instead of raising.
+    # The caller will restart vLLM and retry only the failed prompts.
+    # Pre-v30.3.4 behaviour was "raise RuntimeError → caller falls back
+    # to HF for the entire round", which made a single transient vLLM
+    # crash cost ~80 minutes of HF wall-clock time. With Qwen3.x-A3B
+    # (hybrid Mamba) on H200 the crash rate is ~50% per round; we
+    # cannot afford to abandon vLLM on first crash.
     if _vllm_dead_event().is_set():
         n_done = sum(1 for r in result_slots if r is not None)
         n_failed = len(prompts) - n_done
-        raise RuntimeError(
-            f"vLLM crashed mid-eval after {n_done}/{len(prompts)} prompts "
-            f"({n_failed} failed). Caller should fall back to HF generation."
+        failed_idxs = [i for i, r in enumerate(result_slots) if r is None]
+        print(
+            f"  [vllm] crashed mid-eval: {n_done}/{len(prompts)} done, "
+            f"{n_failed} failed (caller will restart vLLM and retry)",
+            flush=True,
         )
+        return {
+            "results": result_slots,
+            "failed_idxs": failed_idxs,
+            "vllm_crashed": True,
+        }
 
     # Retry failed prompts sequentially. We only get here if the dead-event
     # never fired (i.e. failures were transient per-prompt errors, not a
@@ -14742,46 +17256,19 @@ def _atomic_json_write(path, data):
     On any failure (serialization, disk, etc.) we log a one-line stderr
     message (rate-limited per process) and return — the previous
     version of the file stays intact."""
-    import os as _os
-    import sys as _sys
-    tmp = f"{path}.tmp.{_os.getpid()}"
-    try:
-        with open(tmp, "w") as pf:
-            json.dump(data, pf, default=str, allow_nan=True)
-            pf.flush()
-            try:
-                _os.fsync(pf.fileno())
-            except OSError:
-                pass
-        _os.replace(tmp, path)
-    except Exception as exc:
-        try:
-            _os.unlink(tmp)
-        except OSError:
-            pass
-        # Key on (path, exception type, str(exception)) so distinct failure
-        # modes all get reported once, but we don't spam the log at 1Hz.
-        err_key = f"_atomic_json_write_err_{path}_{type(exc).__name__}_{str(exc)[:80]}"
-        if not globals().get(err_key):
-            globals()[err_key] = True
-            try:
-                import traceback as _tb
-                print(f"[progress] {path} write failed: "
-                      f"{type(exc).__name__}: {exc}", file=_sys.stderr, flush=True)
-                try:
-                    print(f"[progress]   data keys: {list(data.keys()) if hasattr(data, 'keys') else type(data).__name__}",
-                          file=_sys.stderr, flush=True)
-                    print(f"[progress]   data repr: {repr(data)[:400]}",
-                          file=_sys.stderr, flush=True)
-                except Exception:
-                    pass
-                print("[progress] traceback (most recent call last):",
-                      file=_sys.stderr, flush=True)
-                for frame_line in _tb.format_exception(type(exc), exc, exc.__traceback__)[-6:]:
-                    for ln in frame_line.rstrip().splitlines():
-                        print(f"[progress]   {ln}", file=_sys.stderr, flush=True)
-            except Exception:
-                pass
+    _shared_atomic_json_write(path, data)
+
+
+_PROGRESS_WRITERS = {}
+_PROGRESS_LAST_PHASE = {}
+
+
+def _progress_writer(progress_path):
+    writer = _PROGRESS_WRITERS.get(progress_path)
+    if writer is None:
+        writer = DebouncedProgressWriter(progress_path, min_interval_s=0.5)
+        _PROGRESS_WRITERS[progress_path] = writer
+    return writer
 
 
 def _write_phase(progress_path, students, phase, teacher_done=None, **extra):
@@ -14795,7 +17282,29 @@ def _write_phase(progress_path, students, phase, teacher_done=None, **extra):
         "completed": extra.get("completed", []),
         "current": extra.get("current", None),
     }
-    _atomic_json_write(progress_path, data)
+    common = globals().get("_EVAL_PROGRESS_COMMON")
+    if isinstance(common, dict):
+        data.update(common)
+    for key in (
+        "run_started_at",
+        "teacher_started_at",
+        "teacher_finished_at",
+        "original_prompts_total",
+        "effective_prompts_total",
+        "teacher_mode",
+        "policy",
+    ):
+        if key in extra:
+            data[key] = extra[key]
+    force = bool(extra.get("force"))
+    last_phase = _PROGRESS_LAST_PHASE.get(progress_path)
+    if last_phase != phase:
+        force = True
+        _PROGRESS_LAST_PHASE[progress_path] = phase
+    total = data.get("prompts_total") or 0
+    if teacher_done in (0, total):
+        force = True
+    _progress_writer(progress_path).write(data, force=force)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -14804,7 +17313,15 @@ def _write_phase(progress_path, students, phase, teacher_done=None, **extra):
 
 def main():
     parser = argparse.ArgumentParser(description="vLLM-accelerated SN97 evaluation v3")
-    parser.add_argument("--teacher", default="Qwen/Qwen3.5-35B-A3B")
+    # The teacher model is pulled from the runtime config so a teacher swap
+    # (Qwen → Kimi, etc.) doesn't require a code edit in this script. The
+    # ``--teacher`` CLI arg is preserved for ad-hoc overrides; passing
+    # nothing uses the live subnet-config value.
+    try:
+        from eval.runtime import TEACHER_MODEL as _DEFAULT_TEACHER
+    except Exception:
+        _DEFAULT_TEACHER = "Qwen/Qwen3.5-35B-A3B"  # legacy fallback
+    parser.add_argument("--teacher", default=_DEFAULT_TEACHER)
     parser.add_argument("--students", required=True, help="Comma-separated student models")
     parser.add_argument("--revisions", default=None, help="Comma-separated revisions matching --students order")
     parser.add_argument("--prompts", required=True, help="JSON file with prompt texts")
@@ -14816,9 +17333,32 @@ def main():
     parser.add_argument("--save-teacher-logits", default=None)
     parser.add_argument("--king", default=None, help="King model name — stays in VRAM between rounds")
     parser.add_argument("--no-vllm", action="store_true", help="Disable vLLM, use pure HF")
+    # ── Cloud-API teacher path (skips local vLLM + teacher VRAM entirely) ──
+    # When teacher-mode=api we do NOT load the teacher locally at all. We
+    # call an OpenAI-compatible inference provider (OpenRouter / Moonshot /
+    # Cloudflare Workers AI / Together AI / etc.) for both generation and
+    # top-K logprobs, and Phase-1b HF logits is skipped. This frees the
+    # entire pod GPU budget for student scoring and removes the 6+ min
+    # vLLM cold-start. See scripts/api_teacher.py for the full design note.
+    parser.add_argument("--teacher-mode", choices=["vllm", "api"],
+                        default=os.environ.get("DISTIL_TEACHER_MODE", "vllm"),
+                        help="vllm = local vLLM server (default); "
+                             "api = OpenAI-compatible cloud inference "
+                             "(set DISTIL_TEACHER_API_KEY + DISTIL_TEACHER_API_MODEL).")
+    parser.add_argument("--api-base-url", default=None,
+                        help="Override DISTIL_TEACHER_API_BASE (default https://openrouter.ai/api).")
+    parser.add_argument("--api-model", default=None,
+                        help="Override DISTIL_TEACHER_API_MODEL (default moonshotai/kimi-k2.6).")
+    parser.add_argument("--api-endpoint", choices=["chat", "completions"],
+                        default=None,
+                        help="API endpoint flavor; chat (default) or legacy text completions.")
+    parser.add_argument("--api-concurrency", type=int, default=None,
+                        help="Parallel API requests (default 8 / from DISTIL_TEACHER_API_CONCURRENCY).")
+    parser.add_argument("--api-top-logprobs", type=int, default=None,
+                        help="top_logprobs per position (default 20 = OpenAI-spec max).")
     parser.add_argument("--vllm-gpu-util", type=float, default=0.90,
                         help="vLLM GPU memory utilization (default 0.90)")
-    parser.add_argument("--vllm-max-model-len", type=int, default=16384)
+    parser.add_argument("--vllm-max-model-len", type=int, default=8192)
     parser.add_argument("--logprobs-k", type=int, default=128,
                         help="Top-k logprobs to store (128=sparse, 0=full vocab). Default 128.")
     parser.add_argument("--hf-batch-size", type=int, default=2,
@@ -14833,6 +17373,11 @@ def main():
     parser.add_argument("--max-prompt-len", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--max-params-b", type=float, default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
+
+    # Make the resolved teacher name visible to helpers (load_model,
+    # vLLM stub builders) without re-parsing CLI args.
+    global TEACHER_NAME  # noqa: PLW0603
+    TEACHER_NAME = args.teacher or ""
 
     set_capability_block_seed(args.block_seed)
     set_on_policy_rkl_block_seed(args.block_seed)
@@ -14855,63 +17400,10 @@ def main():
         except Exception:
             args.tensor_parallel_size = 1
 
-    # v30.2 — Student-side GPU dispatch.
-    # On a multi-GPU pod, the teacher uses tensor-parallel across all
-    # GPUs (above), but the student forward pass can either:
-    #   (a) Use the same TP layout as the teacher (faster per prompt
-    #       for big students). This is the default when
-    #       DISTIL_STUDENT_TP_SIZE is unset.
-    #   (b) Run multiple students in parallel on disjoint GPU groups
-    #       (faster when many students need scoring per round).
-    #       This requires DISTIL_STUDENT_PARALLELISM > 1, which
-    #       partitions the visible GPUs into N worker groups of
-    #       (total_gpus // N) GPUs each.
-    # Default settings preserve existing single-GPU behaviour.
-    student_tp = os.environ.get("DISTIL_STUDENT_TP_SIZE")
-    if student_tp:
-        try:
-            args.student_tp_size = max(1, int(student_tp))
-        except ValueError:
-            args.student_tp_size = 1
-    else:
-        args.student_tp_size = 1
-    student_par = os.environ.get("DISTIL_STUDENT_PARALLELISM")
-    if student_par:
-        try:
-            args.student_parallelism = max(1, int(student_par))
-        except ValueError:
-            args.student_parallelism = 1
-    else:
-        args.student_parallelism = 1
-    if args.student_parallelism > 1:
-        # Sanity check: parallelism × per-worker GPU count ≤ visible.
-        try:
-            total_gpus = torch.cuda.device_count()
-        except Exception:
-            total_gpus = 1
-        per_worker = max(1, total_gpus // args.student_parallelism)
-        print(
-            f"[eval] Student parallelism: {args.student_parallelism} "
-            f"workers × {per_worker} GPU(s) each "
-            f"(total visible: {total_gpus}). Note: this is currently "
-            f"a configuration knob — the actual worker-pool dispatch "
-            f"will land in v30.4 once a multi-GPU pod is provisioned.",
-            flush=True,
-        )
-
-    # v30.3 — Student-prompt-batch size. When > 1 (and a multi-GPU pod
-    # is available), N consecutive prompts are padded together and run
-    # through the student in a single forward pass. Significantly
-    # speeds up Phase B at the cost of padding overhead. Default 1
-    # preserves existing single-prompt behaviour.
-    #
-    # Implementation note: enabling batched forward requires careful
-    # handling of (a) variable prompt + continuation lengths via
-    # attention masks, (b) per-prompt logits slicing for KL/EOPD/IS-KL
-    # /forking-RKL/trace computation, and (c) memory budget (B prompts
-    # × max_seq_len × vocab_size float32). Default kept at 1 in v30.3;
-    # full implementation lands in v30.4 alongside the worker-pool
-    # dispatch.
+    # Student forward-pass batch size (DISTIL_STUDENT_BATCH_SIZE).
+    # Pads N consecutive prompts together for one forward pass; default
+    # 1 preserves single-prompt behaviour. Values 2–8 give 1.5–3x speedup
+    # on H200-class hardware when prompt-length variance is low.
     student_batch = os.environ.get("DISTIL_STUDENT_BATCH_SIZE")
     if student_batch:
         try:
@@ -14922,9 +17414,8 @@ def main():
         args.student_batch_size = 1
     if args.student_batch_size > 1:
         print(
-            f"[eval] Student batch size: {args.student_batch_size}. "
-            f"Note: this knob is reserved for v30.4 — the "
-            f"per-prompt loop is still single-prompt today.",
+            f"[eval] Student batch size: {args.student_batch_size} "
+            f"(batched forward pass active in KL inner loop).",
             flush=True,
         )
 
@@ -14953,6 +17444,31 @@ def main():
 
     # Progress file path
     progress_path = os.path.join(os.path.dirname(args.output), "eval_progress.json")
+    run_started_at = time.time()
+    original_prompts_total = len(prompts)
+    original_prompts_hash = prompts_hash
+    n_missing_api_logprobs = 0
+    n_api_logprob_prompts_total = None
+    try:
+        policy_meta = policy_metadata() if policy_metadata else {}
+    except Exception:
+        policy_meta = {}
+    script_revision = (
+        os.environ.get("DISTIL_CODE_REVISION")
+        or os.environ.get("GIT_COMMIT")
+        or os.environ.get("REVISION")
+    )
+    progress_common = {
+        "run_started_at": run_started_at,
+        "original_prompts_total": original_prompts_total,
+        "teacher_mode": args.teacher_mode,
+        "policy": policy_meta,
+        "script_revision": script_revision,
+    }
+    globals()["_EVAL_PROGRESS_COMMON"] = progress_common
+    teacher_started_at = None
+    teacher_finished_at = None
+    teacher_api_meta = None
 
     print(f"[eval] {len(prompts)} prompts (hash={prompts_hash}), {len(students)} students", flush=True)
     print(f"[eval] Teacher: {args.teacher}", flush=True)
@@ -15008,10 +17524,240 @@ def main():
                       f"method={cache.get('generation_method', '?')}, "
                       f"probe_refs={'yes' if cache.get('teacher_probe_samples') else 'no'})", flush=True)
                 teacher_cache_loaded = True
+                teacher_started_at = run_started_at
+                teacher_finished_at = time.time()
+                progress_common["teacher_started_at"] = teacher_started_at
+                progress_common["teacher_finished_at"] = teacher_finished_at
             else:
                 print(f"[eval] ✗ Cache stale — regenerating", flush=True)
         except Exception as e:
             print(f"[eval] ✗ Cache failed: {e}", flush=True)
+
+    if not teacher_cache_loaded and args.teacher_mode == "api":
+        # ── Cloud-API teacher path ──
+        # Skips local vLLM/HF teacher entirely. Hits an OpenAI-compatible
+        # provider (default OpenRouter) for both generation and top-K
+        # logprobs. Kimi K2.6 served externally → no 1T-param VRAM, no
+        # 6 min vLLM cold-start, full pod GPU budget freed for students.
+        try:
+            from scripts.api_teacher import (
+                APIConfig, generate_via_api, api_health_check,
+            )
+        except ImportError:
+            import sys as _sys
+            _here = os.path.dirname(os.path.abspath(__file__))
+            if _here not in _sys.path:
+                _sys.path.insert(0, _here)
+            from api_teacher import (  # type: ignore
+                APIConfig, generate_via_api, api_health_check,
+            )
+
+        cfg_kwargs = {}
+        if args.api_base_url:
+            cfg_kwargs["base_url"] = args.api_base_url
+        if args.api_model:
+            cfg_kwargs["model"] = args.api_model
+        if args.api_endpoint:
+            cfg_kwargs["endpoint"] = args.api_endpoint
+        if args.api_concurrency:
+            cfg_kwargs["concurrency"] = args.api_concurrency
+        if args.api_top_logprobs:
+            cfg_kwargs["top_logprobs"] = args.api_top_logprobs
+        api_cfg = APIConfig.from_env(**cfg_kwargs)
+        teacher_api_meta = {
+            "base_url": api_cfg.base_url,
+            "model": api_cfg.model,
+            "endpoint": api_cfg.endpoint,
+            "top_logprobs": api_cfg.top_logprobs,
+            "concurrency": api_cfg.concurrency,
+            "providers": list(api_cfg.providers),
+            "disable_reasoning": api_cfg.disable_reasoning,
+        }
+        progress_common["teacher_api"] = teacher_api_meta
+
+        print(f"\n{'='*60}", flush=True)
+        print(f"PHASE 1: API teacher generation", flush=True)
+        print(f"  provider: {api_cfg.base_url}", flush=True)
+        print(f"  model:    {api_cfg.model}", flush=True)
+        print(f"  endpoint: {api_cfg.endpoint}", flush=True)
+        print(f"  top_lp:   {api_cfg.top_logprobs}  concurrency: {api_cfg.concurrency}", flush=True)
+        print(f"{'='*60}", flush=True)
+        print(f"[teacher_path] api-mode  base={api_cfg.base_url}  model={api_cfg.model}", flush=True)
+
+        # Health check first — fail fast and loud rather than burning 5 min
+        # on per-prompt timeouts when the provider is misconfigured.
+        try:
+            hc = api_health_check(api_cfg)
+            print(
+                f"[api] health_check OK: {hc['elapsed_s']}s, "
+                f"{hc['n_logprob_positions']} positions × top-{hc['per_position_topk']}",
+                flush=True,
+            )
+        except Exception as e:
+            print(f"[api] health_check FAILED: {e}", flush=True)
+            print(
+                f"[teacher_path] api-health-check-failed reason={type(e).__name__}",
+                flush=True,
+            )
+            raise
+
+        token_to_id = _build_token_to_id_map(tokenizer)
+
+        teacher_started_at = time.time()
+        progress_common["teacher_started_at"] = teacher_started_at
+        _write_phase(progress_path, students, "api_generating", prompts_total=len(prompts), force=True)
+        t0 = time.time()
+
+        def _api_progress(done, total):
+            _write_phase(progress_path, students, "api_generating",
+                         teacher_done=done, prompts_total=total)
+
+        try:
+            sequences_data = generate_via_api(
+                prompts, tokenizer, args.max_new_tokens,
+                block_seed=args.block_seed,
+                logprobs_k=api_cfg.top_logprobs,
+                token_to_id=token_to_id,
+                progress_cb=_api_progress,
+                concurrency=api_cfg.concurrency,
+                sparse_converter=vllm_logprobs_to_sparse,
+                align_prompt_boundary=_align_prompt_boundary,
+                config=api_cfg,
+            )
+        except Exception as e:
+            print(f"[eval] API teacher generation failed: {e}", flush=True)
+            print(f"[teacher_path] api-generation-failed reason={type(e).__name__}", flush=True)
+            raise
+
+        timings["api_generation"] = time.time() - t0
+        print(
+            f"[teacher_path] api prompts_done={len(sequences_data)}/{len(prompts)}",
+            flush=True,
+        )
+        print(
+            f"[eval] API teacher generation: {timings['api_generation']:.1f}s",
+            flush=True,
+        )
+
+        # Probe-ref collection via API (greedy text only; no logprobs).
+        try:
+            _tpr_t0 = time.time()
+            think_refs, cap_answers, cap_gen_lens, chat_gen_lens = (
+                prepare_teacher_probe_refs_api(
+                    tokenizer, api_cfg, block_seed=args.block_seed,
+                )
+            )
+            globals()["_TEACHER_PROBE_SAMPLES"] = think_refs
+            globals()["_TEACHER_CAPABILITY_REFS"] = {
+                "answers": cap_answers, "gen_lens": cap_gen_lens,
+            }
+            if chat_gen_lens:
+                globals()["_TEACHER_CHAT_PROBE_GEN_LENS"] = chat_gen_lens
+            timings["teacher_probe_refs"] = time.time() - _tpr_t0
+            teach_chat_mean = (sum(chat_gen_lens) / len(chat_gen_lens)) if chat_gen_lens else 0.0
+            print(
+                f"[eval] Teacher probe refs via API: "
+                f"{len(think_refs)} think + {len(cap_answers)} cap + "
+                f"{len(chat_gen_lens)} chat(mean={teach_chat_mean:.0f}) "
+                f"({timings['teacher_probe_refs']:.1f}s)",
+                flush=True,
+            )
+        except Exception as e:
+            print(f"[eval] Teacher probe refs (API) failed: {e}", flush=True)
+
+        # Roll API results into the same lists the existing logits-aware
+        # downstream code consumes.
+        #
+        # 2026-05-06: OpenRouter/Inceptron sometimes returns valid text but
+        # omits ``logprobs`` for individual prompts. Those entries cannot
+        # contribute to KL, but they should not abort the whole eval after
+        # an hour of API generation. Keep only prompts with sparse teacher
+        # logprobs and align ``prompts`` to the surviving sequence rows.
+        api_logprob_rows = [
+            (idx, data)
+            for idx, data in enumerate(sequences_data)
+            if "sparse_logprobs" in data
+        ]
+        n_api_logprob_prompts_total = len(sequences_data)
+        n_missing_api_logprobs = len(sequences_data) - len(api_logprob_rows)
+        if n_missing_api_logprobs:
+            print(
+                f"[eval] API teacher omitted logprobs for "
+                f"{n_missing_api_logprobs}/{len(sequences_data)} prompts; "
+                f"dropping those prompts from KL scoring.",
+                flush=True,
+            )
+        if not api_logprob_rows:
+            raise RuntimeError(
+                "API teacher returned no prompts with sparse_logprobs; "
+                "cannot compute KL for this round"
+            )
+        coverage_stats = validate_teacher_logprob_coverage(
+            len(sequences_data), len(api_logprob_rows)
+        )
+        print(
+            f"[eval] API teacher logprob coverage: "
+            f"{coverage_stats['n_teacher_prompts_with_logprobs']}/"
+            f"{coverage_stats['n_teacher_prompts_total']} "
+            f"({coverage_stats['teacher_logprob_coverage']:.1%})",
+            flush=True,
+        )
+        prompts = [prompts[idx] for idx, _data in api_logprob_rows]
+        sequences_data = [data for _idx, data in api_logprob_rows]
+        prompts_hash = hashlib.md5(json.dumps(prompts).encode()).hexdigest()[:8]
+        progress_common["effective_prompts_total"] = len(prompts)
+        progress_common["effective_prompts_hash"] = prompts_hash
+        progress_common.update(coverage_stats)
+
+        for data in sequences_data:
+            full_ids = data["full_ids"].to(device)
+            prompt_lens.append(data["prompt_len"])
+            full_sequences.append(full_ids)
+            teacher_logits_list.append(data["sparse_logprobs"])
+
+        timings["teacher_logits_pass"] = 0.0
+        timings["teacher_hf_load"] = 0.0
+        print(
+            f"\n{'='*60}\n"
+            f"PHASE 1b: SKIPPED — API logprobs available (top-{api_cfg.top_logprobs})\n"
+            f"{'='*60}",
+            flush=True,
+        )
+
+        # Save cache (cheap — sparse top-K is tens of MB).
+        if args.save_teacher_logits:
+            try:
+                st = os.statvfs(os.path.dirname(args.save_teacher_logits) or '/')
+                free_gb = (st.f_bavail * st.f_frsize) / (1024**3)
+                if free_gb > 5:
+                    cache_tmp = args.save_teacher_logits + ".tmp"
+                    torch.save({
+                        "full_sequences": [s.cpu() for s in full_sequences],
+                        "teacher_logits": teacher_logits_list,
+                        "prompt_lens": prompt_lens,
+                        "block_seed": args.block_seed,
+                        "prompts_hash": prompts_hash,
+                        "requested_prompts_hash": original_prompts_hash,
+                        "effective_prompts_hash": prompts_hash,
+                        "n_teacher_prompts_total": n_api_logprob_prompts_total,
+                        "n_teacher_prompts_with_logprobs": len(full_sequences),
+                        "n_teacher_prompts_dropped_missing_logprobs": n_missing_api_logprobs,
+                        "generation_method": f"api:{api_cfg.model}",
+                        "logprobs_k": api_cfg.top_logprobs,
+                        "sparse": True,
+                        "teacher_probe_samples": globals().get("_TEACHER_PROBE_SAMPLES", []),
+                        "teacher_capability_refs": globals().get("_TEACHER_CAPABILITY_REFS", {}),
+                        "teacher_capability_block_seed": args.block_seed,
+                        "teacher_chat_probe_gen_lens": globals().get("_TEACHER_CHAT_PROBE_GEN_LENS", []),
+                    }, cache_tmp)
+                    os.replace(cache_tmp, args.save_teacher_logits)
+                    cache_size = os.path.getsize(args.save_teacher_logits) / (1024**2)
+                    print(f"[eval] Cache saved ({cache_size:.1f}MB, method=api:{api_cfg.model})", flush=True)
+            except Exception as e:
+                print(f"[eval] Cache save failed: {e}", flush=True)
+
+        del sequences_data
+        teacher_cache_loaded = True
 
     if not teacher_cache_loaded and not args.no_vllm:
         # ── vLLM generation path ──
@@ -15033,7 +17779,9 @@ def main():
         print(f"PHASE 1a: vLLM teacher generation", flush=True)
         print(f"{'='*60}", flush=True)
 
-        _write_phase(progress_path, students, "vllm_starting", prompts_total=len(prompts))
+        teacher_started_at = time.time()
+        progress_common["teacher_started_at"] = teacher_started_at
+        _write_phase(progress_path, students, "vllm_starting", prompts_total=len(prompts), force=True)
         t0 = time.time()
         vllm_ok = start_vllm_server(
             args.teacher, args.vllm_gpu_util, args.vllm_max_model_len,
@@ -15052,18 +17800,152 @@ def main():
                 _write_phase(progress_path, students, "vllm_generating",
                              teacher_done=done, prompts_total=total)
             try:
-                sequences_data = generate_via_vllm(
-                    prompts, tokenizer, args.max_new_tokens, args.block_seed,
-                    logprobs_k=args.logprobs_k, token_to_id=token_to_id,
-                    progress_cb=_vllm_progress, concurrency=args.concurrency,
-                )
-                timings["vllm_generation"] = time.time() - t0
-                # 2026-04-29 (v29.7): explicit path tag so snapshot tools can
-                # distinguish "ran on vLLM" from "fell back to HF". The bot's
-                # 40-line tail snapshot needs this to answer "is the eval
-                # using HF again?" correctly.
-                print(f"[teacher_path] vllm  prompts_done={len(sequences_data)}/{len(prompts)}", flush=True)
-                print(f"[eval] vLLM generation: {timings['vllm_generation']:.1f}s", flush=True)
+                # 2026-04-30 (v30.3.4): vLLM auto-restart-and-resume.
+                # vLLM 0.19.1 + Qwen3.x-A3B (hybrid Mamba/transformer
+                # MoE) crashes intermittently on H200 mid-eval: the
+                # EngineCore subprocess exits cleanly (no OOM, KV
+                # cache <5%, no CUDA errors) and the API server
+                # exits with the leaked-semaphore signature. Crash
+                # rate is ~50% per round across both Qwen3.5 and
+                # Qwen3.6, so a single-shot fall-back to HF was
+                # costing ~80 min of wall-clock per affected round.
+                #
+                # New behaviour: when vLLM crashes mid-eval, we
+                # restart the server and re-submit ONLY the failed
+                # prompts. Up to MAX_RESTARTS attempts. Successful
+                # results are preserved across restarts. Caller
+                # falls back to HF only if every restart attempt
+                # crashes again — extremely unlikely given crashes
+                # are intermittent rather than deterministic.
+                MAX_RESTARTS = int(os.environ.get(
+                    "DISTIL_VLLM_MAX_RESTARTS", "3"
+                ) or 3)
+                pending_idxs = list(range(len(prompts)))
+                accumulated = [None] * len(prompts)
+                attempt = 0
+                last_partial = None
+                while pending_idxs:
+                    pending_prompts = [prompts[i] for i in pending_idxs]
+                    out = generate_via_vllm(
+                        pending_prompts, tokenizer, args.max_new_tokens,
+                        args.block_seed, logprobs_k=args.logprobs_k,
+                        token_to_id=token_to_id,
+                        progress_cb=lambda d, t: _vllm_progress(
+                            sum(1 for r in accumulated if r is not None) + d,
+                            len(prompts),
+                        ),
+                        concurrency=args.concurrency,
+                    )
+                    if isinstance(out, dict) and out.get("vllm_crashed"):
+                        # Partial success — fold completed slots in.
+                        for local_i, item_idx in enumerate(pending_idxs):
+                            if out["results"][local_i] is not None:
+                                accumulated[item_idx] = out["results"][local_i]
+                        # Recompute pending = still-None positions in
+                        # the accumulated list.
+                        pending_idxs = [
+                            i for i, r in enumerate(accumulated) if r is None
+                        ]
+                        n_done = len(prompts) - len(pending_idxs)
+                        last_partial = (n_done, attempt + 1)
+                        attempt += 1
+                        if attempt >= MAX_RESTARTS:
+                            print(
+                                f"  [vllm] gave up after {MAX_RESTARTS} "
+                                f"restart attempts ({n_done}/{len(prompts)} "
+                                f"done). Falling back to HF for the "
+                                f"remaining {len(pending_idxs)} prompts.",
+                                flush=True,
+                            )
+                            break
+                        print(
+                            f"  [vllm] restart attempt "
+                            f"{attempt}/{MAX_RESTARTS}: stopping dead "
+                            f"vLLM and starting fresh server "
+                            f"({n_done}/{len(prompts)} prompts already "
+                            f"have results, {len(pending_idxs)} pending)",
+                            flush=True,
+                        )
+                        # 2026-05-01 (v30.3.5): the dead vLLM EngineCore
+                        # subprocess leaks ~3 GiB of GPU memory that
+                        # nvidia-smi takes 10-30s to actually reclaim.
+                        # Without waiting, the next vLLM startup hits
+                        # ``ValueError: Free memory on device cuda:0
+                        # (116.47/139.8 GiB) ... is less than desired
+                        # GPU memory utilization (0.85, 118.83 GiB)``
+                        # because the eval pod is co-tenant with the
+                        # chat-king vLLM (which holds ~21 GiB at
+                        # 0.15 util). Wait actively for memory to
+                        # come back, with a generous timeout.
+                        stop_vllm_server()
+                        _wait_for_gpu_memory_free(
+                            min_free_gb=int(
+                                args.vllm_gpu_util
+                                * _gpu_total_gb()
+                                + 4
+                            ),
+                            timeout_s=60,
+                        )
+                        if not start_vllm_server(
+                            args.teacher, args.vllm_gpu_util,
+                            args.vllm_max_model_len,
+                            tensor_parallel_size=args.tensor_parallel_size,
+                        ):
+                            print(
+                                "  [vllm] restart failed — falling back "
+                                "to HF for remaining prompts",
+                                flush=True,
+                            )
+                            break
+                    else:
+                        # Plain list = full success (or per-prompt
+                        # transient retries already reconciled).
+                        # Fold all results into accumulated and exit
+                        # the loop.
+                        for local_i, item_idx in enumerate(pending_idxs):
+                            accumulated[item_idx] = out[local_i]
+                        pending_idxs = []
+                if not pending_idxs:
+                    sequences_data = accumulated
+                    timings["vllm_generation"] = time.time() - t0
+                    if attempt > 0:
+                        print(
+                            f"[eval] vLLM generation succeeded after "
+                            f"{attempt} restart(s); "
+                            f"{timings['vllm_generation']:.1f}s total",
+                            flush=True,
+                        )
+                    print(
+                        f"[teacher_path] vllm "
+                        f"prompts_done={len(sequences_data)}/{len(prompts)} "
+                        f"restarts={attempt}",
+                        flush=True,
+                    )
+                    print(
+                        f"[eval] vLLM generation: "
+                        f"{timings['vllm_generation']:.1f}s",
+                        flush=True,
+                    )
+                else:
+                    # vLLM exhausted MAX_RESTARTS and we still have
+                    # pending prompts. Discard the partial accumulator
+                    # and fall through to the HF-fallback path so the
+                    # whole batch is regenerated by HF transformers.
+                    # We could in principle merge partial vLLM results
+                    # with HF-generated remainder, but the two paths
+                    # produce slightly different logprob distributions
+                    # (vLLM sparse top-K vs HF dense), and mixing them
+                    # in one round risks subtle bias. Cleaner to redo
+                    # the round on a uniform path. Future v30.3.5
+                    # could add HF top-up if crash rate stays high.
+                    sequences_data = None
+                    n_done = len(prompts) - len(pending_idxs)
+                    print(
+                        f"[teacher_path] vllm-restarts-exhausted "
+                        f"partial={n_done}/{len(prompts)} "
+                        f"discarding-and-falling-back-to-HF",
+                        flush=True,
+                    )
             except Exception as e:
                 print(f"[eval] vLLM generation failed: {e} — falling back to HF", flush=True)
                 print(f"[teacher_path] hf-fallback-after-vllm-crash  reason={type(e).__name__}", flush=True)
@@ -15220,6 +18102,8 @@ def main():
         stop_vllm_server()
         time.sleep(3)
         free_gpu()
+        teacher_started_at = time.time()
+        progress_common["teacher_started_at"] = teacher_started_at
 
         print(f"\n{'='*60}", flush=True)
         print(f"PHASE 1 FALLBACK: HF teacher generation + logit extraction", flush=True)
@@ -15362,6 +18246,12 @@ def main():
         else:
             print(f"[eval] All {len(prompts)} prompts have >={MIN_COMPLETION_TOKENS} completion tokens — no filtering needed", flush=True)
 
+    effective_prompts_hash = hashlib.md5(json.dumps(prompts).encode()).hexdigest()[:8]
+    teacher_finished_at = time.time()
+    progress_common["teacher_finished_at"] = teacher_finished_at
+    progress_common["effective_prompts_total"] = len(prompts)
+    progress_common["effective_prompts_hash"] = effective_prompts_hash
+
     # ═══════════════════════════════════════════════════════════════════
     # PHASE 1e: Save eval data for reproducibility
     # ═══════════════════════════════════════════════════════════════════
@@ -15415,9 +18305,23 @@ def main():
 
     results = {
         "teacher": args.teacher,
+        "teacher_mode": args.teacher_mode,
+        "teacher_api": teacher_api_meta,
         "max_new_tokens": args.max_new_tokens,
         "block_seed": args.block_seed,
         "tensor_parallel_size": args.tensor_parallel_size,
+        "policy": policy_meta,
+        "script_revision": script_revision,
+        "run_started_at": run_started_at,
+        "teacher_started_at": teacher_started_at,
+        "teacher_finished_at": teacher_finished_at,
+        "original_prompts_total": original_prompts_total,
+        "original_prompts_hash": original_prompts_hash,
+        "effective_prompts_hash": effective_prompts_hash,
+        "n_teacher_prompts_total": n_api_logprob_prompts_total or original_prompts_total,
+        "n_teacher_prompts_with_logprobs": len(prompts),
+        "n_teacher_prompts_dropped_missing_logprobs": n_missing_api_logprobs,
+        "teacher_logprob_coverage": progress_common.get("teacher_logprob_coverage"),
         "n_prompts": len(prompts),
         "n_prompts_filtered": n_filtered,
         "min_completion_tokens": MIN_COMPLETION_TOKENS,
@@ -15426,15 +18330,28 @@ def main():
     for name, data in prior_results.items():
         if data.get("status") != "load_failed" and data.get("kl_global_avg") is not None:
             results["students"][name] = data
+    # Expose the live results dict to the top-level exception handler so
+    # any partial scoring is persisted before the script dies. See
+    # _ensure_results_file at the bottom of this file.
+    globals()["_LIVE_RESULTS"] = results
 
     # Live progress
     progress_lock = threading.Lock()
     live_progress = {
         "phase": "scoring", "students": students,
         "students_total": len(students), "prompts_total": len(prompts),
+        # Phase A is complete by the time we initialise this dict; carry
+        # the final teacher_prompts_done count forward so the dashboard's
+        # Phase A bar stays at "60/60" instead of resetting to 0 the
+        # moment Phase 2 (per-student loop) starts. Without this the
+        # validator's pod_session.py poller reads None and miners read
+        # the empty bar as "we lost the teacher cache".
+        "teacher_prompts_done": len(prompts),
+        **progress_common,
         "completed": [], "current": None,
     }
-    def _write_progress():
+    student_started_at = None
+    def _write_progress(force: bool = False):
         """Write current live progress to disk for dashboard consumption.
         Uses atomic tmp+rename via _atomic_json_write so partial writes
         can't leave a zero-byte file that the validator then fails to
@@ -15445,8 +18362,8 @@ def main():
                 snapshot["current"] = dict(snapshot["current"])
             if "completed" in snapshot and isinstance(snapshot["completed"], list):
                 snapshot["completed"] = list(snapshot["completed"])
-        _atomic_json_write(progress_path, snapshot)
-    _write_progress()
+        _progress_writer(progress_path).write(snapshot, force=force)
+    _write_progress(force=True)
 
     # Early stopping state. args.early_stop_min <= 0 disables it outright.
     best_kl_so_far = None
@@ -15476,8 +18393,63 @@ def main():
 
     vram_before_students = torch.cuda.memory_allocated() if torch.cuda.is_available() else 0
 
+    # Tracks whether the CUDA context has been poisoned by an earlier
+    # device-side assertion. Once set, every subsequent CUDA op in this
+    # process raises and the only way to recover is to exit and let the
+    # validator re-launch us on the next round. Rather than crashing
+    # mid-loop and losing the result file, we fast-fail remaining
+    # students with a deferred status and break out cleanly so the
+    # final json.dump still runs.
+    _cuda_poisoned = False
+
+    def _cuda_alive() -> bool:
+        """Cheap probe to detect a poisoned CUDA context.
+
+        Runs a 1-element allocate-and-empty round-trip. If the context
+        is fine, this is sub-microsecond. If a previous student tripped
+        a device-side assertion, this raises immediately. We swallow
+        the exception and return False so the caller can decide what to
+        do (typically: defer the rest of the round)."""
+        if not torch.cuda.is_available():
+            return True
+        try:
+            _t = torch.zeros((1,), device="cuda")
+            _t.add_(1.0)
+            torch.cuda.synchronize()
+            del _t
+            return True
+        except Exception:
+            return False
+
     for student_idx, student_name in enumerate(students):
         student_rev = student_revisions.get(student_name, "main")
+        if _cuda_poisoned:
+            # Earlier student wedged the GPU. Defer remaining students
+            # to the next round rather than DQ'ing them on a process-
+            # local failure that has nothing to do with their model.
+            print(
+                f"\n[eval] {student_name}: DEFERRED — CUDA context poisoned by "
+                f"a previous student in this round. Will retry next round.",
+                flush=True,
+            )
+            results["students"][student_name] = {
+                "status": "deferred_cuda_poisoned",
+                "kl_global_avg": None,
+                "error": "cuda_context_poisoned_in_prev_student",
+            }
+            try:
+                with open(args.output, "w") as f:
+                    json.dump(results, f, indent=2)
+            except Exception:
+                pass
+            live_progress["completed"].append({
+                "student_name": student_name,
+                "status": "deferred_cuda_poisoned",
+                "finished_at": time.time(),
+            })
+            live_progress["current"] = None
+            _write_progress(force=True)
+            continue
         # Skip already scored
         if student_name in results["students"]:
             prior = results["students"][student_name]
@@ -15500,6 +18472,7 @@ def main():
               (" (KING — stays in VRAM)" if student_name == king_name else ""), flush=True)
 
         model_start = time.time()
+        student_started_at = model_start
         ensure_disk_space(args.teacher)
 
         # Prefetch next student
@@ -15511,8 +18484,34 @@ def main():
 
         # Load student (or reuse king)
         live_progress["phase"] = "loading_student"
-        live_progress["current"] = {"student_name": student_name, "student_idx": student_idx, "prompts_done": 0}
-        _write_progress()
+        live_progress["current"] = {
+            "student_name": student_name,
+            "student_idx": student_idx,
+            "prompts_done": 0,
+            "stage": "loading_weights",
+            "student_started_at": student_started_at,
+        }
+        _write_progress(force=True)
+
+        # 2026-05-04: ``_set_stage`` lets the dashboard show what's
+        # actually happening between "loading_student" and "kl scoring
+        # 0/60 prompts". Without it, the entire probe pipeline (chat
+        # ~65s + capability ~36s + judge ~16s + LFJ ~720s on derail-
+        # prone students + chat-turns ~180s + bench battery ~300s)
+        # runs while the dashboard says "0/60 prompts" — miners then
+        # complain in #distil-97 that the eval is stuck. The stage
+        # label travels through state.eval_progress.json and the API
+        # surfaces it to the live panel.
+        def _set_stage(name: str, **extra) -> None:
+            cur = live_progress.get("current") or {}
+            if not isinstance(cur, dict):
+                return
+            force = cur.get("stage") != name
+            cur["stage"] = name
+            for k, v in extra.items():
+                cur[k] = v
+            live_progress["current"] = cur
+            _write_progress(force=force)
 
         is_king = (student_name == king_name)
 
@@ -15538,17 +18537,31 @@ def main():
                 results["timings"] = {k: round(v, 1) for k, v in timings.items()}
                 with open(args.output, "w") as f:
                     json.dump(results, f, indent=2)
-                live_progress["completed"].append({"student_name": student_name, "status": "load_failed"})
+                _finished_at = time.time()
+                live_progress["completed"].append({
+                    "student_name": student_name,
+                    "status": "load_failed",
+                    "started_at": student_started_at,
+                    "finished_at": _finished_at,
+                    "elapsed_s": round(_finished_at - student_started_at, 1),
+                })
                 live_progress["current"] = None
-                _write_progress()
+                _write_progress(force=True)
                 try: del student
                 except: pass
                 free_gpu()
                 clean_model_cache(student_name, args.teacher)
                 continue
 
-            # VRAM fraud check
-            MAX_STUDENT_VRAM_GB = 20.0
+            # 2026-05-03 (Kimi K2.6 cutover): VRAM fraud cap recalibrated for
+            # 33B-param Kimi students. Previous 20GB cap was sized for 7B
+            # Qwen students (~14GB bf16). 33B bf16 weights = 66GB exactly;
+            # plus a small headroom for embedding tables / activation
+            # scratch on a freshly-loaded model. A genuinely fraudulent
+            # student (claiming 33B but loading 50B+) blows past 100GB and
+            # is still caught. Reference: subnet-config.json
+            # teacher.maxStudentParams = 33,000,000,000 → 66 GiB at bf16.
+            MAX_STUDENT_VRAM_GB = 75.0
             if not is_king and student_vram_gb > MAX_STUDENT_VRAM_GB:
                 msg = f"FRAUD: student VRAM delta {student_vram_gb:.1f}GB > {MAX_STUDENT_VRAM_GB}GB"
                 print(f"  ⚠️ {msg}", flush=True)
@@ -15633,6 +18646,7 @@ def main():
             chat_probe_this = False
         if chat_probe_this:
             try:
+                _set_stage("chat_probe")
                 _cp_start = time.time()
                 cprobe = chat_response_probe(student, tokenizer, device)
                 _cp_dur = time.time() - _cp_start
@@ -15689,13 +18703,12 @@ def main():
         # legitimately emit long chain-of-thought before EOS.
         #
         # The entire probe pipeline (generation, Wilson bounds, per-student
-        # storage) is retained but gated behind an opt-in env var so we can
-        # re-enable it offline once it is properly calibrated against a
-        # real teacher baseline. Default is OFF: the probe does NOT run,
-        # does NOT consume GPU time, and CANNOT DQ a model.
+        # storage) is retained behind a kill-switch env var. Default is ON
+        # because deployed chat uses thinking, and collapse under thinking is
+        # exactly the pathology this subnet must optimize away.
         think_probe_this = (
             student is not None
-            and os.environ.get("THINK_COLLAPSE_PROBE", "0") == "1"
+            and os.environ.get("THINK_COLLAPSE_PROBE", "1") == "1"
         )
         if is_king and king_model is not None and student is king_model and load_time == 0.0:
             think_probe_this = False
@@ -15755,6 +18768,7 @@ def main():
             cap_probe_this = False
         if cap_probe_this:
             try:
+                _set_stage("capability_probe")
                 _cp_start = time.time()
                 cap = capability_probe(student, tokenizer, device)
                 _cp_dur = time.time() - _cp_start
@@ -15798,6 +18812,7 @@ def main():
             judge_collect_this = False
         if judge_collect_this:
             try:
+                _set_stage("judge_probe")
                 _jp_start = time.time()
                 judge_raw = judge_response_probe(student, tokenizer, device)
                 _jp_dur = time.time() - _jp_start
@@ -15835,8 +18850,62 @@ def main():
             long_form_collect_this = False
         if long_form_collect_this:
             try:
+                _set_stage("long_form_judge_probe")
                 _lf_start = time.time()
-                lf_raw = long_form_judge_response_probe(student, tokenizer, device)
+                # 2026-05-04: adaptive LFJ cap based on chat_probe.
+                # Derail-prone students (chat term=0/N, every trivial
+                # prompt fills the chat-probe budget) reliably fill
+                # the full LFJ_MAX_TOKENS=6144 budget too — confirmed
+                # in distil-97 round 04:15 where talent-richer/top-
+                # student burnt 1027s = 17 min on LFJ alone, all 8
+                # responses hit the 6144-cap. Capping at 2048 for
+                # those students cuts LFJ wall time by ~70% (5 min vs
+                # 17 min) while preserving the derail signal: the
+                # coherence detector keys off response-length and
+                # punctuation density, neither of which needs the
+                # full 5300-token derailed tail. Healthy students
+                # (term_rate >= 0.5) keep the full 6144 cap because
+                # they typically emit EOS at 500-1000 tokens anyway,
+                # so the cap is moot for them.
+                lf_cap_override = None
+                _cprobe_meta = (
+                    results["students"].get(student_name, {}).get("chat_probe")
+                )
+                if isinstance(_cprobe_meta, dict):
+                    _term = int(_cprobe_meta.get("prompts_terminated") or 0)
+                    _tested = int(_cprobe_meta.get("prompts_tested") or 0)
+                    _mean_gen = float(_cprobe_meta.get("mean_gen_tokens") or 0.0)
+                    _term_rate = (_term / _tested) if _tested > 0 else 1.0
+                    # Three-tier derail detection. Healthy students that
+                    # emit EOS at 50-200 tokens stay at the full cap;
+                    # mid-ramblers (mean >= 400) get 4096 to save 33%
+                    # while still capturing the tail; chronic derailers
+                    # (term <= 0.25 OR mean >= 600) get 2048; extreme
+                    # cases (term=0/N AND mean ~= chat_max) get 1024.
+                    if _tested > 0:
+                        if _term == 0 and _mean_gen >= (CHAT_PROBE_MAX_TOKENS * 0.85):
+                            lf_cap_override = 1024
+                            tier = "extreme"
+                        elif _term_rate <= 0.25 or _mean_gen >= 600:
+                            lf_cap_override = 2048
+                            tier = "chronic"
+                        elif _mean_gen >= 400:
+                            lf_cap_override = 4096
+                            tier = "mid"
+                        else:
+                            tier = None
+                        if lf_cap_override is not None:
+                            print(
+                                f"  [lfj] {tier}-derail detected (chat term="
+                                f"{_term}/{_tested}, mean_gen={_mean_gen:.0f}); "
+                                f"capping LFJ_MAX_TOKENS={LONG_FORM_JUDGE_MAX_TOKENS}"
+                                f"→{lf_cap_override} ({tier} tier)",
+                                flush=True,
+                            )
+                lf_raw = long_form_judge_response_probe(
+                    student, tokenizer, device,
+                    max_tokens_override=lf_cap_override,
+                )
                 _lf_dur = time.time() - _lf_start
                 if lf_raw and lf_raw.get("responses"):
                     _lf_store = globals().setdefault("_LONG_FORM_JUDGE_ROLLOUTS", {})
@@ -15871,6 +18940,7 @@ def main():
             chat_turns_collect_this = False
         if chat_turns_collect_this:
             try:
+                _set_stage("chat_turns_probe")
                 _ct_start = time.time()
                 chat_turns_raw = chat_turns_response_probe(
                     student, tokenizer, device)
@@ -15916,7 +18986,67 @@ def main():
             bench_this = False
         if bench_this:
             try:
-                bench_res = run_bench_battery(student, tokenizer, device)
+                _set_stage("bench_battery")
+                # 2026-05-04: derail-aware bench budget. Same logic as the
+                # LFJ adaptive cap above. A model that can't terminate a
+                # 4-prompt chat probe at the budget will burn the full
+                # AIME 1024-token budget too — the answer-extractor finds
+                # the same "nothing" in both cases. Cut the per-prompt
+                # token budget to 25% for derail-detected students,
+                # saving ~19 min per derailed student on bench battery.
+                global _BENCH_TOKEN_BUDGET_FACTOR
+                _BENCH_TOKEN_BUDGET_FACTOR = 1.0
+                _cprobe_meta = (
+                    results["students"].get(student_name, {}).get("chat_probe")
+                )
+                if isinstance(_cprobe_meta, dict):
+                    _term = int(_cprobe_meta.get("prompts_terminated") or 0)
+                    _tested = int(_cprobe_meta.get("prompts_tested") or 0)
+                    _mean_gen = float(_cprobe_meta.get("mean_gen_tokens") or 0.0)
+                    _term_rate = (_term / _tested) if _tested > 0 else 1.0
+                    # Same three-tier model as LFJ above. Healthy
+                    # students keep the full budget; mid-ramblers get
+                    # 50% (~9 min saved); chronic derailers 25% (~19
+                    # min saved); extreme cases 15% (~22 min saved).
+                    # The per-axis answer extractors find the same
+                    # "nothing" in 25% of the budget as in the full
+                    # budget for derailed students, so this is a
+                    # pure latency win — no signal lost.
+                    if _tested > 0:
+                        if _term == 0 and _mean_gen >= (CHAT_PROBE_MAX_TOKENS * 0.85):
+                            _BENCH_TOKEN_BUDGET_FACTOR = 0.15
+                            tier = "extreme"
+                        elif _term_rate <= 0.25 or _mean_gen >= 600:
+                            _BENCH_TOKEN_BUDGET_FACTOR = 0.25
+                            tier = "chronic"
+                        elif _mean_gen >= 400:
+                            _BENCH_TOKEN_BUDGET_FACTOR = 0.5
+                            tier = "mid"
+                        else:
+                            tier = None
+                        if _BENCH_TOKEN_BUDGET_FACTOR < 1.0:
+                            pct = int(_BENCH_TOKEN_BUDGET_FACTOR * 100)
+                            print(
+                                f"  [bench] {tier}-derail detected (chat term="
+                                f"{_term}/{_tested}, mean_gen={_mean_gen:.0f}); "
+                                f"capping per-axis MAX_TOKENS to {pct}% "
+                                f"({tier} tier)",
+                                flush=True,
+                            )
+                # Surface the in-flight axis to the dashboard so the
+                # ~25-min bench phase doesn't look stuck. The
+                # _set_stage helper is captured from the enclosing
+                # main() scope.
+                def _bench_stage_cb(axis_name: str, ax_idx: int, ax_total: int):
+                    _set_stage(
+                        f"bench_battery:{axis_name}",
+                        bench_axis_idx=ax_idx,
+                        bench_axis_total=ax_total,
+                    )
+                bench_res = run_bench_battery(
+                    student, tokenizer, device,
+                    stage_callback=_bench_stage_cb,
+                )
                 total_w = bench_res.pop("_total_wall_s", 0.0)
                 results["students"].setdefault(student_name, {})
                 summary_bits = []
@@ -16008,6 +19138,110 @@ def main():
         ):
             effective_total = king_prompts_done
 
+        # v30.4 — Batched student forward pass.
+        # When ``DISTIL_STUDENT_BATCH_SIZE > 1``, we pad K consecutive
+        # prompts together and run a single forward pass on the batch,
+        # then slice each prompt's logits back out for the existing
+        # per-prompt sub-computations. The padding overhead (right-pad
+        # to max length) is small for similar-length prompts and large
+        # for very-uneven prompts, but the wall-time win on a multi-GPU
+        # pod is typically 2-3x for B=4.
+        student_batch_size = max(1, int(os.environ.get(
+            "DISTIL_STUDENT_BATCH_SIZE", "1"
+        )))
+        s_logits_cache: list[torch.Tensor] = []
+        cache_start = -1
+        # Resolve a pad_id for batched forward — required when seqs have
+        # different lengths. Falls back to eos_id if pad_token is None.
+        pad_id_batched = (
+            getattr(tokenizer, "pad_token_id", None)
+            if tokenizer is not None else None
+        )
+        if pad_id_batched is None and tokenizer is not None:
+            pad_id_batched = getattr(tokenizer, "eos_token_id", 0) or 0
+        if pad_id_batched is None:
+            pad_id_batched = 0
+
+        # Read the student's actual embedding-table size. Comparing
+        # against this (not config.vocab_size, which can lie) is the
+        # only way to detect token IDs that would trip CUDA's
+        # vectorized_gather "index out of bounds" device-side
+        # assertion in F.embedding. A poisoned CUDA context after that
+        # assertion takes down free_gpu() too and aborts the whole
+        # pod_eval before any results are written, so this guard
+        # converts the would-be CUDA crash into a normal Python
+        # ValueError that the per-prompt try/except below catches and
+        # DQs the student cleanly.
+        try:
+            _student_vocab = int(
+                student.get_input_embeddings().weight.shape[0]
+            )
+        except Exception:
+            _student_vocab = None
+
+        def _validate_token_ids(seq_tensor):
+            """Raise ValueError if any token in ``seq_tensor`` would index
+            past the student's embedding table. ``seq_tensor`` is shape
+            ``[B, T]`` (or ``[1, T]``) of int64 token IDs on any device."""
+            if _student_vocab is None:
+                return
+            try:
+                hi = int(seq_tensor.max().item())
+                lo = int(seq_tensor.min().item())
+            except Exception:
+                return
+            if hi >= _student_vocab or lo < 0:
+                raise ValueError(
+                    f"vocab_oob: token id {hi} (min {lo}) exceeds student "
+                    f"embed_size {_student_vocab}. Student claims vocab "
+                    f"compatibility with the teacher tokenizer but its "
+                    f"embedding table is smaller — likely a config edited "
+                    f"to match the teacher without retraining the embeddings. "
+                    f"DQ before forward pass to keep CUDA context clean."
+                )
+
+        def _refill_cache(i: int) -> None:
+            """Refill ``s_logits_cache`` with the next K prompts'
+            student logits via a single batched forward pass."""
+            nonlocal s_logits_cache, cache_start
+            cache_start = i
+            B = min(student_batch_size, effective_total - i)
+            if B == 1:
+                # Single-prompt path: keep the existing semantics
+                # (no padding overhead).
+                full_seq = full_sequences[i]
+                _validate_token_ids(full_seq)
+                s_logits = student(full_seq).logits.float()
+                s_logits_cache = [s_logits]
+                return
+            batch_seqs = full_sequences[i:i + B]
+            seq_lens = [int(s.shape[1]) for s in batch_seqs]
+            max_len = max(seq_lens)
+            padded = torch.full(
+                (B, max_len), pad_id_batched,
+                dtype=torch.long, device=device,
+            )
+            attn_mask = torch.zeros(
+                (B, max_len), dtype=torch.long, device=device,
+            )
+            for j, (s, ln) in enumerate(zip(batch_seqs, seq_lens)):
+                padded[j, :ln] = s.to(device).flatten()[:ln]
+                attn_mask[j, :ln] = 1
+            _validate_token_ids(padded)
+            try:
+                batch_out = student(padded, attention_mask=attn_mask)
+                batch_logits = batch_out.logits.float()
+            except TypeError:
+                # Some causal LMs don't accept attention_mask kwarg —
+                # fall back to no-mask forward (causal mask still
+                # applies internally).
+                batch_logits = student(padded).logits.float()
+            # Slice per-prompt logits back to [1, seq_len, vocab].
+            s_logits_cache = [
+                batch_logits[j:j + 1, :seq_lens[j], :]
+                for j in range(B)
+            ]
+
         t0 = time.time()
         with torch.no_grad():
             for i in range(effective_total):
@@ -16017,8 +19251,10 @@ def main():
                     tl_entry = teacher_logits_list[i]
                     is_sparse = _is_sparse_logits(tl_entry)
 
-                    # Student forward pass
-                    s_logits = student(full_seq).logits.float()
+                    # Student forward pass (batched if BATCH_SIZE > 1).
+                    if i >= cache_start + len(s_logits_cache):
+                        _refill_cache(i)
+                    s_logits = s_logits_cache[i - cache_start]
                     cont_s = s_logits[:, prompt_len - 1:-1, :]
 
                     topk_shadow = {}
@@ -16334,6 +19570,8 @@ def main():
                         "prompts_done": i + 1, "prompts_total": effective_total,
                         "kl_running_mean": round(running_mean, 6),
                         "best_kl_so_far": round(best_kl_so_far, 6) if best_kl_so_far else None,
+                        "stage": "kl_scoring",
+                        "student_started_at": student_started_at,
                     }
                     _write_progress()
 
@@ -16673,6 +19911,7 @@ def main():
         with open(args.output, "w") as f:
             json.dump(results, f, indent=2)
 
+        student_finished_at = time.time()
         live_progress["completed"].append({
             "student_name": student_name,
             "status": results["students"].get(student_name, {}).get("status", "unknown"),
@@ -16680,17 +19919,30 @@ def main():
             "prompts_scored": len(kl_per_prompt),
             "prompts_total": effective_total,
             "early_stop_reason": early_stop_reason,
+            "started_at": student_started_at,
+            "finished_at": student_finished_at,
+            "elapsed_s": round(student_finished_at - student_started_at, 1),
         })
         live_progress["current"] = None
-        _write_progress()
+        _write_progress(force=True)
 
         # Cleanup — DON'T unload king
         if not is_king:
-            del student
+            try:
+                del student
+            except Exception:
+                pass
             free_gpu()
             clean_model_cache(student_name, args.teacher)
         else:
-            torch.cuda.empty_cache()
+            try:
+                torch.cuda.empty_cache()
+            except Exception as _exc:
+                print(
+                    f"  [cleanup] empty_cache after king skipped: "
+                    f"{type(_exc).__name__}: {str(_exc)[:120]}",
+                    flush=True,
+                )
 
         # Wait for prefetch
         if prefetch_future:
@@ -16699,6 +19951,20 @@ def main():
             except Exception:
                 pass
             prefetch_future = None
+
+        # Probe CUDA before moving on. If a previous handler swallowed a
+        # device-side assertion (or something else corrupted the
+        # context), every subsequent forward pass will fail. Mark the
+        # context as poisoned so the next iteration skips straight to
+        # the deferred branch and we still write a usable results.json.
+        if not _cuda_alive():
+            _cuda_poisoned = True
+            print(
+                f"  [cuda] context poisoned after {student_name}; "
+                f"remaining {len(students) - student_idx - 1} student(s) "
+                f"will be deferred to next round.",
+                flush=True,
+            )
 
     # ── Phase B: teacher-side scoring (RKL + judge) ─────────────────
     # After the student loop, load the teacher once and run every
@@ -16716,30 +19982,69 @@ def main():
         or (LONG_FORM_JUDGE_ENABLED and _lf_store)
     )
     if _need_teacher:
+        # 2026-05-04: in API teacher mode the local `load_model` would
+        # try to download Kimi K2.6 (~600 GB) and load it into the
+        # H200's 140 GB VRAM, which is simply impossible. The previous
+        # behaviour silently failed via the outer try/except, dropping
+        # judge / chat-turns / long-form-judge scores from EVERY round
+        # since the cutover. We now route each Phase B grading task
+        # through the same OpenRouter API used for Phase A logprob
+        # collection. RKL still requires local logits (it's a true KL,
+        # not a rubric grade) so it's no-op'd in API mode.
+        _phb_api_mode = (
+            getattr(args, "teacher_mode", "vllm") == "api"
+            or os.environ.get("DISTIL_TEACHER_MODE", "").lower() == "api"
+        )
         try:
+            _rkl_label_phb = "off" if _phb_api_mode else (
+                "on" if (ON_POLICY_RKL_ENABLED and _rkl_store) else "off")
             print(f"\n[eval] Phase B: teacher-side scoring "
-                  f"(RKL={'on' if (ON_POLICY_RKL_ENABLED and _rkl_store) else 'off'}, "
+                  f"(mode={'api' if _phb_api_mode else 'local'}, "
+                  f"RKL={_rkl_label_phb}, "
                   f"judge={'on' if (JUDGE_PROBE_ENABLED and _judge_store) else 'off'}, "
                   f"chat_turns={'on' if (CHAT_TURNS_PROBE_ENABLED and _chat_store) else 'off'}, "
                   f"long_form_judge={'on' if (LONG_FORM_JUDGE_ENABLED and _lf_store) else 'off'})",
                   flush=True)
-            # Free the king if it's still resident — teacher forward pass
-            # wants all the VRAM it can get.
-            try:
-                if king_model is not None:
-                    del king_model
-                    king_model = None
-            except Exception:
-                pass
-            free_gpu()
+            # Free the king if it's still resident — local teacher
+            # forward pass wants all the VRAM. Skip the GPU dance in
+            # API mode since we don't load anything onto the GPU.
+            if not _phb_api_mode:
+                try:
+                    if king_model is not None:
+                        del king_model
+                        king_model = None
+                except Exception:
+                    pass
+                free_gpu()
             _phb_t0 = time.time()
-            teacher_b = load_model(args.teacher, device)
-            teacher_b.eval()
-            print(f"[eval] Teacher reloaded for Phase B ({time.time() - _phb_t0:.0f}s), "
-                  f"VRAM: {gpu_mem_str()}", flush=True)
+            teacher_b = None
+            api_cfg_phb = None
+            if _phb_api_mode:
+                # Build (or rebuild) an APIConfig from env. Phase A
+                # already validated the credentials so this should
+                # always succeed; if it doesn't, the Phase A pass
+                # would have aborted the round long before we got here.
+                try:
+                    from scripts.api_teacher import APIConfig
+                except ImportError:
+                    from api_teacher import APIConfig  # type: ignore
+                api_cfg_phb = APIConfig.from_env()
+                print(f"[eval] Phase B via API ({api_cfg_phb.model})", flush=True)
+            else:
+                teacher_b = load_model(args.teacher, device)
+                teacher_b.eval()
+                print(f"[eval] Teacher reloaded for Phase B ({time.time() - _phb_t0:.0f}s), "
+                      f"VRAM: {gpu_mem_str()}", flush=True)
 
             # ── Phase B.1: on-policy RKL scoring ────────────────────
-            if ON_POLICY_RKL_ENABLED and _rkl_store:
+            # 2026-05-04: in API mode there's no local teacher to
+            # gather full logits from, and the OpenAI logprobs spec
+            # only exposes top-K — that's enough for KL distillation
+            # (Phase A) but not for a true on-policy reverse-KL score
+            # which needs the full distribution. Skip RKL in API mode;
+            # ON_POLICY_RKL_IN_COMPOSITE is already 0 in production
+            # post-cutover so this doesn't move composite rankings.
+            if ON_POLICY_RKL_ENABLED and _rkl_store and not _phb_api_mode:
                 _rkl_t0 = time.time()
                 n_scored = 0
                 for sn, rolls in _rkl_store.items():
@@ -16787,7 +20092,13 @@ def main():
                 for sn, collected in _judge_store.items():
                     try:
                         _jb_s_t0 = time.time()
-                        judged = judge_teacher_score(teacher_b, tokenizer, collected, device=device)
+                        if _phb_api_mode:
+                            judged = judge_teacher_score_api(
+                                api_cfg_phb, tokenizer, collected,
+                                concurrency=max(1, getattr(api_cfg_phb, "concurrency", 4) // 2),
+                            )
+                        else:
+                            judged = judge_teacher_score(teacher_b, tokenizer, collected, device=device)
                         dur = time.time() - _jb_s_t0
                         payload = {
                             "n": judged["n"],
@@ -16830,9 +20141,15 @@ def main():
                 for sn, collected in _lf_store.items():
                     try:
                         _lf_s_t0 = time.time()
-                        judged_lf = long_form_judge_teacher_score(
-                            teacher_b, tokenizer, collected, device=device,
-                        )
+                        if _phb_api_mode:
+                            judged_lf = long_form_judge_teacher_score_api(
+                                api_cfg_phb, tokenizer, collected,
+                                concurrency=max(1, getattr(api_cfg_phb, "concurrency", 4) // 2),
+                            )
+                        else:
+                            judged_lf = long_form_judge_teacher_score(
+                                teacher_b, tokenizer, collected, device=device,
+                            )
                         dur = time.time() - _lf_s_t0
                         payload = {
                             "n": judged_lf["n"],
@@ -16842,7 +20159,20 @@ def main():
                             "per_prompt": judged_lf.get("per_prompt", []),
                             "scoring_time": round(dur, 1),
                             "in_composite": LONG_FORM_JUDGE_IN_COMPOSITE,
-                            "version": 1,
+                            # 2026-05-04 — propagate the per-axis derail
+                            # diagnostics so the validator-side derail-DQ
+                            # message can quote a real coherence_factor
+                            # instead of "None". Both fields are computed
+                            # in long_form_judge_teacher_score{,_api} but
+                            # were dropped from the payload pre-2026-05-04,
+                            # leading to misleading `aggregate factor=None`
+                            # text in disqualified.json entries.
+                            "coherence_factor": judged_lf.get("coherence_factor"),
+                            "termination_factor": judged_lf.get("termination_factor"),
+                            "normalized_pre_coherence": judged_lf.get(
+                                "normalized_pre_coherence"
+                            ),
+                            "version": 2,
                         }
                         if sn in results["students"]:
                             results["students"][sn]["long_form_judge_probe"] = payload
@@ -16877,8 +20207,14 @@ def main():
                 for sn, collected in _chat_store.items():
                     try:
                         _ct_s_t0 = time.time()
-                        judged = chat_turns_teacher_score(
-                            teacher_b, tokenizer, collected, device=device)
+                        if _phb_api_mode:
+                            judged = chat_turns_teacher_score_api(
+                                api_cfg_phb, tokenizer, collected,
+                                concurrency=max(1, getattr(api_cfg_phb, "concurrency", 4) // 2),
+                            )
+                        else:
+                            judged = chat_turns_teacher_score(
+                                teacher_b, tokenizer, collected, device=device)
                         dur = time.time() - _ct_s_t0
                         payload = {
                             "n": judged["n"],
@@ -16915,11 +20251,12 @@ def main():
                       f"({_chat_label})",
                       flush=True)
 
-            try:
-                del teacher_b
-            except Exception:
-                pass
-            free_gpu()
+            if not _phb_api_mode:
+                try:
+                    del teacher_b
+                except Exception:
+                    pass
+                free_gpu()
             timings["phase_b_total"] = time.time() - _phb_t0
         except Exception as e:
             print(f"[eval] Phase B teacher scoring failed (non-fatal): {e}", flush=True)
@@ -16998,6 +20335,51 @@ def _write_abort_marker(out_path, reason):
         pass
 
 
+def _ensure_results_file(out_path, reason):
+    """Make sure ``out_path`` (the eval results JSON) exists on disk.
+
+    The validator's pod.download() raises FileNotFoundError if the script
+    crashes before the final json.dump in main(). That kills the entire
+    round even when the in-memory ``results`` dict had partial scores
+    that should have been preserved.
+
+    Strategy:
+      1. If ``_LIVE_RESULTS`` is populated (set by main() after the
+         results dict is constructed), persist it as JSON. The dict is
+         updated in-place after every student so even a mid-round crash
+         keeps the per-student rows that were already scored.
+      2. If we have nothing to write, create a minimal stub file with
+         the abort reason so the validator can still download something
+         and surface a real error message rather than "No such file".
+    """
+    try:
+        live = globals().get("_LIVE_RESULTS")
+        if isinstance(live, dict):
+            try:
+                live.setdefault("_aborted", True)
+                live["_abort_reason"] = reason[:500]
+            except Exception:
+                pass
+            with open(out_path, "w") as fh:
+                json.dump(live, fh, indent=2)
+            return True
+    except Exception:
+        pass
+    try:
+        with open(out_path, "w") as fh:
+            json.dump(
+                {
+                    "students": {},
+                    "_aborted": True,
+                    "_abort_reason": reason[:500],
+                },
+                fh,
+            )
+        return True
+    except Exception:
+        return False
+
+
 if __name__ == "__main__":
     _out_guess = None
     for i, a in enumerate(sys.argv):
@@ -17008,6 +20390,7 @@ if __name__ == "__main__":
     def _sig(signum, _frame):
         reason = f"signal_{signum}"
         if _out_guess:
+            _ensure_results_file(_out_guess, reason)
             _write_abort_marker(_out_guess, reason)
         stop_vllm_server()
         sys.exit(128 + (signum or 0))
@@ -17023,6 +20406,8 @@ if __name__ == "__main__":
     except SystemExit:
         raise
     except BaseException as _exc:
+        reason = f"exception:{type(_exc).__name__}:{str(_exc)[:200]}"
         if _out_guess:
-            _write_abort_marker(_out_guess, f"exception:{type(_exc).__name__}")
+            _ensure_results_file(_out_guess, reason)
+            _write_abort_marker(_out_guess, reason)
         raise
